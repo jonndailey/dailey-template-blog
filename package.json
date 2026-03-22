@@ -1,0 +1,14 @@
+{
+  "name": "dailey-template-blog",
+  "version": "1.0.0",
+  "description": "Full blog engine with admin panel, markdown, categories, and RSS",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "migrate": "node migrate.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "mysql2": "^3.6.0"
+  }
+}

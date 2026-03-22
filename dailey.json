@@ -1,0 +1,9 @@
+{
+  "name": "Blog",
+  "description": "Full blog engine with admin panel, markdown, categories, and RSS",
+  "icon": "edit",
+  "category": "content",
+  "services": { "database": true, "auth": false },
+  "repo": "https://github.com/jonndailey/dailey-template-blog.git",
+  "branch": "main"
+}
