@@ -379,7 +379,7 @@ function layout(title, content, options = {}) {
   <footer>
     <div class="container">
       <div class="footer-name">${SITE_NAME}</div>
-      <div class="footer-powered">Powered by <a href="https://dailey.cloud">Dailey OS</a></div>
+      <div class="footer-powered">Powered by <a href="https://dailey.cloud">Dailey OS</a> &middot; <a href="/admin">Admin</a></div>
       <div class="footer-copy">&copy; ${new Date().getFullYear()} ${SITE_NAME}. All rights reserved.</div>
     </div>
   </footer>
