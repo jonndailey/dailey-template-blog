@@ -5,7 +5,7 @@ const { migrate } = require('./migrate');
 const app = express();
 const PORT = process.env.PORT || 3000;
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'admin';
-const SITE_NAME = process.env.SITE_NAME || 'My Blog';
+const SITE_NAME = process.env.SITE_NAME || 'The Velo Blog';
 const SITE_URL = process.env.SITE_URL || `http://localhost:${PORT}`;
 
 let pool;
@@ -91,8 +91,8 @@ function layout(title, content, options = {}) {
       font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
       line-height: 1.7; color: #1a1a2e; background: #fafafa;
     }
-    a { color: #4361ee; text-decoration: none; }
-    a:hover { color: #3a0ca3; text-decoration: underline; }
+    a { color: #6366f1; text-decoration: none; }
+    a:hover { color: #4338ca; text-decoration: underline; }
     .container { max-width: 780px; margin: 0 auto; padding: 0 24px; }
     header {
       background: #fff; border-bottom: 1px solid #e8e8e8; padding: 20px 0;
@@ -100,18 +100,18 @@ function layout(title, content, options = {}) {
     }
     header .container { display: flex; align-items: center; justify-content: space-between; }
     header .logo { font-size: 22px; font-weight: 700; color: #1a1a2e; }
-    header .logo:hover { text-decoration: none; color: #4361ee; }
+    header .logo:hover { text-decoration: none; color: #6366f1; }
     header nav a { margin-left: 28px; font-size: 15px; color: #555; font-weight: 500; }
-    header nav a:hover { color: #4361ee; text-decoration: none; }
+    header nav a:hover { color: #6366f1; text-decoration: none; }
     main { padding: 48px 0 80px; min-height: 60vh; }
     footer { background: #fff; border-top: 1px solid #e8e8e8; padding: 32px 0; text-align: center; color: #888; font-size: 14px; }
     .post-card { background: #fff; border-radius: 12px; padding: 32px; margin-bottom: 24px; border: 1px solid #e8e8e8; transition: box-shadow 0.2s; }
     .post-card:hover { box-shadow: 0 4px 20px rgba(0,0,0,0.06); }
     .post-card h2 { font-size: 24px; margin-bottom: 8px; }
     .post-card h2 a { color: #1a1a2e; }
-    .post-card h2 a:hover { color: #4361ee; text-decoration: none; }
+    .post-card h2 a:hover { color: #6366f1; text-decoration: none; }
     .post-meta { font-size: 14px; color: #888; margin-bottom: 12px; }
-    .post-meta .category { background: #eef0ff; color: #4361ee; padding: 2px 10px; border-radius: 12px; font-size: 12px; font-weight: 600; }
+    .post-meta .category { background: #eef0ff; color: #6366f1; padding: 2px 10px; border-radius: 12px; font-size: 12px; font-weight: 600; }
     .post-meta .tag { background: #f0f0f0; color: #666; padding: 2px 8px; border-radius: 8px; font-size: 11px; margin-left: 4px; }
     .post-excerpt { color: #555; font-size: 16px; line-height: 1.6; }
     .post-content { background: #fff; border-radius: 12px; padding: 48px; border: 1px solid #e8e8e8; }
@@ -125,10 +125,10 @@ function layout(title, content, options = {}) {
     .post-content pre { background: #1a1a2e; color: #e8e8e8; padding: 20px; border-radius: 8px; overflow-x: auto; margin: 20px 0; }
     .post-content pre code { background: none; color: inherit; padding: 0; }
     .post-content hr { border: none; border-top: 1px solid #e8e8e8; margin: 32px 0; }
-    .post-content a { border-bottom: 1px solid #4361ee; }
+    .post-content a { border-bottom: 1px solid #6366f1; }
     .post-content strong { font-weight: 600; }
-    .btn { display: inline-block; padding: 10px 24px; background: #4361ee; color: #fff; border: none; border-radius: 8px; font-size: 15px; font-weight: 600; cursor: pointer; transition: background 0.2s; }
-    .btn:hover { background: #3a0ca3; color: #fff; text-decoration: none; }
+    .btn { display: inline-block; padding: 10px 24px; background: #6366f1; color: #fff; border: none; border-radius: 8px; font-size: 15px; font-weight: 600; cursor: pointer; transition: background 0.2s; }
+    .btn:hover { background: #4338ca; color: #fff; text-decoration: none; }
     .btn-danger { background: #e63946; }
     .btn-danger:hover { background: #c1121f; }
     .btn-sm { padding: 6px 16px; font-size: 13px; }
@@ -145,7 +145,7 @@ function layout(title, content, options = {}) {
     .form-group label { display: block; font-size: 14px; font-weight: 600; color: #333; margin-bottom: 6px; }
     .form-group input, .form-group textarea, .form-group select { width: 100%; padding: 10px 14px; border: 1px solid #ddd; border-radius: 8px; font-size: 15px; font-family: inherit; }
     .form-group textarea { min-height: 300px; line-height: 1.6; }
-    .form-group input:focus, .form-group textarea:focus, .form-group select:focus { outline: none; border-color: #4361ee; box-shadow: 0 0 0 3px rgba(67,97,238,0.1); }
+    .form-group input:focus, .form-group textarea:focus, .form-group select:focus { outline: none; border-color: #6366f1; box-shadow: 0 0 0 3px rgba(67,97,238,0.1); }
     .login-box { max-width: 400px; margin: 80px auto; background: #fff; padding: 40px; border-radius: 12px; border: 1px solid #e8e8e8; }
     .login-box h1 { font-size: 24px; text-align: center; margin-bottom: 24px; }
     .alert { padding: 12px 16px; border-radius: 8px; margin-bottom: 20px; font-size: 14px; }
@@ -153,7 +153,7 @@ function layout(title, content, options = {}) {
     .alert-success { background: #e8fde8; color: #2d6a4f; }
     .category-list { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 32px; }
     .category-list a { padding: 8px 20px; background: #fff; border: 1px solid #e8e8e8; border-radius: 20px; font-size: 14px; font-weight: 500; color: #555; }
-    .category-list a:hover, .category-list a.active { background: #4361ee; color: #fff; border-color: #4361ee; text-decoration: none; }
+    .category-list a:hover, .category-list a.active { background: #6366f1; color: #fff; border-color: #6366f1; text-decoration: none; }
     .page-title { font-size: 32px; margin-bottom: 8px; }
     .page-subtitle { color: #888; font-size: 16px; margin-bottom: 32px; }
     .checkbox-group { display: flex; align-items: center; gap: 8px; }
@@ -248,7 +248,7 @@ app.get('/', async (req, res) => {
 
     const html = `
       <h1 class="page-title">${SITE_NAME}</h1>
-      <p class="page-subtitle">Thoughts, tutorials, and insights</p>
+      <p class="page-subtitle">Product updates, engineering deep-dives, and company news</p>
       <div class="category-list">
         <a href="/" class="${!category ? 'active' : ''}">All</a>
         ${categoryLinks}
