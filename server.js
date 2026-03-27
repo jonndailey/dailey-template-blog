@@ -5,7 +5,7 @@ const { migrate } = require('./migrate');
 const app = express();
 const PORT = process.env.PORT || 3000;
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'admin';
-const SITE_NAME = process.env.SITE_NAME || 'The Velo Blog';
+const SITE_NAME = process.env.SITE_NAME || 'The Dailey Company Blog';
 const SITE_URL = process.env.SITE_URL || `http://localhost:${PORT}`;
 
 let pool;
