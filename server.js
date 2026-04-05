@@ -1,372 +1,1585 @@
+const crypto = require('crypto');
 const express = require('express');
 const mysql = require('mysql2/promise');
+const multer = require('multer');
+const path = require('path');
+const { S3Client, PutObjectCommand, GetObjectCommand, DeleteObjectCommand } = require('@aws-sdk/client-s3');
+const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 const { migrate } = require('./migrate');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'admin';
+const ADMIN_SESSION_SECRET = process.env.ADMIN_SESSION_SECRET || '';
+const ADMIN_SESSION_COOKIE = 'blog_admin_session';
+const ADMIN_SESSION_TTL_MS = 12 * 60 * 60 * 1000;
+const LOGIN_WINDOW_MS = 15 * 60 * 1000;
+const LOGIN_MAX_ATTEMPTS = 5;
+const IS_PRODUCTION = process.env.NODE_ENV === 'production';
 const SITE_NAME = process.env.SITE_NAME || 'The Dailey Company Blog';
 const SITE_URL = process.env.SITE_URL || `http://localhost:${PORT}`;
+const SITE_DESCRIPTION =
+  process.env.SITE_DESCRIPTION ||
+  'Product updates, engineering notes, customer stories, and company news from Dailey.';
+const MEDIA_UPLOAD_MAX_BYTES = 128 * 1024 * 1024;
+const STORAGE_BUCKET = process.env.S3_BUCKET_NAME || process.env.S3_BUCKET || '';
+const STORAGE_PREFIX = normalizeStoragePrefix(process.env.S3_KEY_PREFIX || process.env.S3_PREFIX || '');
+const ALLOWED_MEDIA_MIME_TYPES = new Set([
+  'image/avif',
+  'image/gif',
+  'image/jpeg',
+  'image/png',
+  'image/webp',
+  'video/mp4',
+  'video/ogg',
+  'video/quicktime',
+  'video/webm',
+  'video/x-m4v',
+]);
 
 let pool;
+let storageClient;
+const loginAttempts = new Map();
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: MEDIA_UPLOAD_MAX_BYTES },
+  fileFilter: (_req, file, callback) => {
+    if (ALLOWED_MEDIA_MIME_TYPES.has(String(file.mimetype || '').toLowerCase())) {
+      return callback(null, true);
+    }
+
+    const error = new Error('Only JPG, PNG, WebP, GIF, AVIF, MP4, WebM, OGG, MOV, and M4V files are allowed.');
+    error.code = 'UNSUPPORTED_MEDIA_TYPE';
+    callback(error);
+  },
+});
 
 async function getPool() {
+  if (!process.env.DATABASE_URL) {
+    throw new Error('DATABASE_URL is not set');
+  }
+
   if (!pool) {
     pool = mysql.createPool(process.env.DATABASE_URL);
   }
+
   return pool;
 }
 
+function hasStorageConfig() {
+  return Boolean(
+    process.env.S3_ENDPOINT &&
+      STORAGE_BUCKET &&
+      process.env.S3_ACCESS_KEY_ID &&
+      process.env.S3_SECRET_ACCESS_KEY
+  );
+}
+
+function getStorageClient() {
+  if (!hasStorageConfig()) {
+    throw new Error('S3-compatible storage is not configured.');
+  }
+
+  if (!storageClient) {
+    storageClient = new S3Client({
+      region: process.env.S3_REGION || 'auto',
+      endpoint: process.env.S3_ENDPOINT,
+      credentials: {
+        accessKeyId: process.env.S3_ACCESS_KEY_ID,
+        secretAccessKey: process.env.S3_SECRET_ACCESS_KEY,
+      },
+      forcePathStyle: true,
+    });
+  }
+
+  return storageClient;
+}
+
+app.disable('x-powered-by');
+if (!IS_PRODUCTION) {
+  app.use('/media', express.static(path.join(__dirname, 'public', 'media')));
+}
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
+app.use((req, res, next) => {
+  const csp = [
+    "default-src 'self'",
+    "base-uri 'self'",
+    "frame-ancestors 'none'",
+    "form-action 'self'",
+    "object-src 'none'",
+    "script-src 'none'",
+    "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
+    "font-src 'self' https://fonts.gstatic.com data:",
+    "img-src 'self' https: data:",
+    "media-src 'self' https:",
+    "frame-src 'self' https://www.youtube.com https://www.youtube-nocookie.com",
+    "connect-src 'self'",
+  ];
 
-// Simple markdown renderer
-function renderMarkdown(text) {
-  if (!text) return '';
-  let html = text
-    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
-    // Headers
-    .replace(/^### (.+)$/gm, '<h3>$1</h3>')
-    .replace(/^## (.+)$/gm, '<h2>$1</h2>')
-    .replace(/^# (.+)$/gm, '<h1>$1</h1>')
-    // Bold and italic
-    .replace(/\*\*\*(.+?)\*\*\*/g, '<strong><em>$1</em></strong>')
-    .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
-    .replace(/\*(.+?)\*/g, '<em>$1</em>')
-    // Code blocks
-    .replace(/```(\w*)\n([\s\S]*?)```/g, '<pre><code>$2</code></pre>')
-    .replace(/`([^`]+)`/g, '<code>$1</code>')
-    // Links
-    .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2">$1</a>')
-    // Horizontal rule
-    .replace(/^---$/gm, '<hr>')
-    // Lists
-    .replace(/^(\d+)\. (.+)$/gm, '<li>$2</li>')
-    .replace(/^- (.+)$/gm, '<li>$1</li>');
-
-  // Wrap consecutive <li> items in <ul>
-  html = html.replace(/((?:<li>.*<\/li>\n?)+)/g, '<ul>$1</ul>');
-
-  // Paragraphs - wrap lines that aren't already wrapped in tags
-  const lines = html.split('\n');
-  const result = [];
-  let inBlock = false;
-  for (const line of lines) {
-    const trimmed = line.trim();
-    if (!trimmed) { result.push(''); continue; }
-    if (trimmed.startsWith('<h') || trimmed.startsWith('<ul') || trimmed.startsWith('<ol') ||
-        trimmed.startsWith('<pre') || trimmed.startsWith('<hr') || trimmed.startsWith('<li') ||
-        trimmed.startsWith('</')) {
-      result.push(trimmed);
-    } else {
-      result.push(`<p>${trimmed}</p>`);
-    }
+  if (IS_PRODUCTION) {
+    csp.push('upgrade-insecure-requests');
+    res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains; preload');
   }
-  return result.join('\n');
+
+  res.setHeader('Content-Security-Policy', csp.join('; '));
+  res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
+  res.setHeader('Cross-Origin-Resource-Policy', 'same-origin');
+  res.setHeader('Permissions-Policy', 'accelerometer=(), camera=(), geolocation=(), gyroscope=(), microphone=(), payment=(), usb=()');
+  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  next();
+});
+
+function escapeHtml(value) {
+  return String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function safeUrl(value) {
+  return escapeHtml(value);
+}
+
+function normalizeStoragePrefix(value) {
+  return String(value || '')
+    .trim()
+    .replace(/^\/+/, '')
+    .replace(/\/+$/, '');
+}
+
+function formatBytes(bytes) {
+  const size = Number(bytes || 0);
+  if (size <= 0) return '0 B';
+  const units = ['B', 'KB', 'MB', 'GB'];
+  const index = Math.min(Math.floor(Math.log(size) / Math.log(1024)), units.length - 1);
+  const value = size / Math.pow(1024, index);
+  return `${value.toFixed(value >= 10 || index === 0 ? 0 : 1)} ${units[index]}`;
+}
+
+function mediaKindFromMime(mimeType) {
+  const normalized = String(mimeType || '').toLowerCase();
+  if (normalized.startsWith('image/')) return 'image';
+  if (normalized.startsWith('video/')) return 'video';
+  return 'file';
+}
+
+function fileSlug(filename) {
+  const original = path.basename(String(filename || '').trim());
+  const extension = path.extname(original).toLowerCase();
+  const base = slugify(original.slice(0, extension ? -extension.length : undefined)) || 'asset';
+  return `${base}${extension}`;
+}
+
+function buildMediaPublicPath(media) {
+  return `/media/${media.id}/${encodeURIComponent(fileSlug(media.original_name))}`;
+}
+
+function buildMediaShortcode(media) {
+  const publicPath = buildMediaPublicPath(media);
+  if (media.kind === 'video') return `{{video:${publicPath}|Optional caption}}`;
+  if (media.kind === 'image') return `{{image:${publicPath}|Optional caption}}`;
+  return publicPath;
+}
+
+function buildStorageObjectKey(file) {
+  const kind = mediaKindFromMime(file.mimetype);
+  const parts = [STORAGE_PREFIX, 'media', kind === 'file' ? 'files' : `${kind}s`].filter(Boolean);
+  return `${parts.join('/')}/${Date.now()}-${crypto.randomUUID()}-${fileSlug(file.originalname)}`;
+}
+
+function safeDownloadFilename(value) {
+  return (
+    String(value || '')
+      .replace(/[^\x20-\x7e]+/g, '')
+      .replace(/["\\\r\n;]/g, '')
+      .trim() || 'asset'
+  );
+}
+
+function sanitizeLinkUrl(value) {
+  const trimmed = String(value || '').trim();
+  if (!trimmed) return '#';
+  if (trimmed.startsWith('/') || trimmed.startsWith('#')) return trimmed;
+
+  try {
+    const parsed = new URL(trimmed);
+    if (['http:', 'https:', 'mailto:'].includes(parsed.protocol)) {
+      return trimmed;
+    }
+  } catch {
+    return '#';
+  }
+
+  return '#';
 }
 
 function slugify(text) {
-  return text.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '');
+  return String(text || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/(^-|-$)/g, '');
 }
 
-// Helper: estimate reading time from content (~200 words/min)
 function readingTime(text) {
   if (!text) return '1 min read';
-  const words = text.trim().split(/\s+/).length;
+  const words = String(text).trim().split(/\s+/).filter(Boolean).length;
   const mins = Math.max(1, Math.round(words / 200));
   return `${mins} min read`;
 }
 
-// Category color mapping for visual variety
-const categoryColors = {
-  product:     { bg: '#eef2ff', text: '#4f46e5', border: '#c7d2fe' },
-  engineering: { bg: '#ecfdf5', text: '#059669', border: '#a7f3d0' },
-  company:     { bg: '#fef3c7', text: '#d97706', border: '#fde68a' },
-  customers:   { bg: '#fce7f3', text: '#db2777', border: '#fbcfe8' },
-};
-function getCategoryColor(slug) {
-  return categoryColors[slug] || { bg: '#f1f5f9', text: '#475569', border: '#e2e8f0' };
+function formatDate(value) {
+  if (!value) return '';
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return '';
+
+  return date.toLocaleDateString('en-US', {
+    year: 'numeric',
+    month: 'long',
+    day: 'numeric',
+  });
 }
 
-// Layout wrapper
+function parseTags(value) {
+  if (!value) return [];
+  if (Array.isArray(value)) return value.filter(Boolean);
+
+  try {
+    const parsed = JSON.parse(value);
+    return Array.isArray(parsed) ? parsed.filter(Boolean) : [];
+  } catch {
+    return [];
+  }
+}
+
+function getYouTubeEmbedUrl(videoUrl) {
+  if (!videoUrl) return null;
+
+  const normalized = String(videoUrl).replace(/&amp;/g, '&');
+  const youtubeMatch = normalized.match(
+    /(?:youtube\.com\/(?:watch\?v=|embed\/|shorts\/)|youtu\.be\/)([\w-]{11})/i
+  );
+
+  if (!youtubeMatch) return null;
+  return `https://www.youtube.com/embed/${youtubeMatch[1]}`;
+}
+
+function isHostedVideoUrl(videoUrl) {
+  return /^(?:https?:\/\/|\/).+\.(mp4|m4v|webm|ogg|mov)$/i.test(String(videoUrl || '').trim());
+}
+
+function isHostedImageUrl(imageUrl) {
+  return /^(?:https?:\/\/|\/).+\.(avif|gif|jpe?g|png|webp)$/i.test(String(imageUrl || '').trim());
+}
+
+function resolveVideoUrl(videoUrl) {
+  const trimmed = String(videoUrl || '').trim();
+  if (!trimmed) return '';
+  if (trimmed.startsWith('http://') || trimmed.startsWith('https://') || trimmed.startsWith('/')) {
+    return trimmed;
+  }
+  return `/media/${trimmed.replace(/^\/+/, '')}`;
+}
+
+function renderEmbedBlock(type, videoUrl, caption = '') {
+  const safeCaption = caption ? `<p class="embed-caption">${escapeHtml(caption)}</p>` : '';
+
+  if (type === 'youtube') {
+    const embedUrl = getYouTubeEmbedUrl(videoUrl);
+    if (!embedUrl) {
+      return `<div class="embed-block"><p>Invalid YouTube URL: <a href="${safeUrl(
+        videoUrl
+      )}" target="_blank" rel="noreferrer">${escapeHtml(videoUrl)}</a></p></div>`;
+    }
+
+    return compactHtml(`
+      <div class="embed-block">
+        <div class="embed-shell">
+          <iframe
+            title="${caption ? escapeHtml(caption) : 'Embedded video'}"
+            src="${safeUrl(embedUrl)}"
+            allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
+            allowfullscreen
+          ></iframe>
+        </div>
+        ${safeCaption}
+      </div>`);
+  }
+
+  if (type === 'image') {
+    const resolvedUrl = resolveVideoUrl(videoUrl);
+    if (!isHostedImageUrl(resolvedUrl)) {
+      return `<div class="embed-block"><p>Invalid hosted image URL: <a href="${safeUrl(
+        resolvedUrl
+      )}" target="_blank" rel="noreferrer">${escapeHtml(videoUrl)}</a></p></div>`;
+    }
+
+    return compactHtml(`
+      <figure class="embed-block image-embed">
+        <img src="${safeUrl(resolvedUrl)}" alt="${caption ? escapeHtml(caption) : ''}" loading="lazy">
+        ${caption ? `<figcaption class="embed-caption">${escapeHtml(caption)}</figcaption>` : ''}
+      </figure>`);
+  }
+
+  const resolvedUrl = resolveVideoUrl(videoUrl);
+  if (!isHostedVideoUrl(resolvedUrl)) {
+    return `<div class="embed-block"><p>Invalid hosted video URL: <a href="${safeUrl(
+      resolvedUrl
+    )}" target="_blank" rel="noreferrer">${escapeHtml(videoUrl)}</a></p></div>`;
+  }
+
+  return compactHtml(`
+    <div class="embed-block">
+      <div class="embed-shell">
+        <video controls playsinline preload="metadata">
+          <source src="${safeUrl(resolvedUrl)}">
+        </video>
+      </div>
+      ${safeCaption}
+    </div>`);
+}
+
+function parseEmbedLine(line) {
+  const trimmed = line.trim();
+  if (!trimmed) return null;
+
+  const shortcode = trimmed.match(/^\{\{(youtube|video|image):([^|}]+?)(?:\|(.+?))?\}\}$/i);
+  if (shortcode) {
+    return {
+      type: shortcode[1].toLowerCase(),
+      url: shortcode[2].trim(),
+      caption: (shortcode[3] || '').trim(),
+    };
+  }
+
+  const youtubeUrl = getYouTubeEmbedUrl(trimmed);
+  if (youtubeUrl) {
+    return { type: 'youtube', url: trimmed, caption: '' };
+  }
+
+  if (isHostedVideoUrl(trimmed)) {
+    return { type: 'video', url: trimmed, caption: '' };
+  }
+
+  if (isHostedImageUrl(trimmed)) {
+    return { type: 'image', url: trimmed, caption: '' };
+  }
+
+  return null;
+}
+
+function renderMarkdown(text) {
+  if (!text) return '';
+
+  const embeds = [];
+  const preprocessed = String(text)
+    .split('\n')
+    .map((line) => {
+      const embed = parseEmbedLine(line);
+      if (!embed) return line;
+
+      const token = `__EMBED_${embeds.length}__`;
+      embeds.push(renderEmbedBlock(embed.type, embed.url, embed.caption));
+      return token;
+    })
+    .join('\n');
+
+  let html = escapeHtml(preprocessed)
+    .replace(/```(\w*)\n([\s\S]*?)```/g, (_, _lang, code) => `<pre><code>${code.trimEnd()}</code></pre>`)
+    .replace(/^### (.+)$/gm, '<h3>$1</h3>')
+    .replace(/^## (.+)$/gm, '<h2>$1</h2>')
+    .replace(/^# (.+)$/gm, '<h1>$1</h1>')
+    .replace(/^> (.+)$/gm, '<blockquote><p>$1</p></blockquote>')
+    .replace(/\*\*\*(.+?)\*\*\*/g, '<strong><em>$1</em></strong>')
+    .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+    .replace(/\*(.+?)\*/g, '<em>$1</em>')
+    .replace(/`([^`]+)`/g, '<code>$1</code>')
+    .replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_match, label, url) => {
+      const sanitizedUrl = sanitizeLinkUrl(url);
+      const href = safeUrl(sanitizedUrl);
+      const external = /^https?:\/\//i.test(sanitizedUrl) ? ' target="_blank" rel="noreferrer"' : '';
+      return `<a href="${href}"${external}>${label}</a>`;
+    })
+    .replace(/^---$/gm, '<hr>')
+    .replace(/^(\d+)\. (.+)$/gm, '<li>$2</li>')
+    .replace(/^- (.+)$/gm, '<li>$1</li>');
+
+  html = html.replace(/((?:<li>.*<\/li>\n?)+)/g, '<ul>$1</ul>');
+
+  embeds.forEach((embedHtml, index) => {
+    html = html.replace(`__EMBED_${index}__`, embedHtml);
+  });
+
+  const lines = html.split('\n');
+  const rendered = [];
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed) {
+      rendered.push('');
+      continue;
+    }
+
+    if (
+      trimmed.startsWith('<h') ||
+      trimmed.startsWith('<ul') ||
+      trimmed.startsWith('<ol') ||
+      trimmed.startsWith('<pre') ||
+      trimmed.startsWith('<hr') ||
+      trimmed.startsWith('<li') ||
+      trimmed.startsWith('<blockquote') ||
+      trimmed.startsWith('<div class="embed-block"') ||
+      trimmed.startsWith('<figure class="embed-block"') ||
+      trimmed.startsWith('</')
+    ) {
+      rendered.push(trimmed);
+    } else {
+      rendered.push(`<p>${trimmed}</p>`);
+    }
+  }
+
+  return rendered.join('\n').replace(/<\/ul>\s*<ul>/g, '');
+}
+
+function compactHtml(html) {
+  return html.replace(/\s*\n\s*/g, ' ').replace(/\s{2,}/g, ' ').trim();
+}
+
+function parseCookies(cookieHeader) {
+  return String(cookieHeader || '')
+    .split(';')
+    .map((part) => part.trim())
+    .filter(Boolean)
+    .reduce((cookies, part) => {
+      const separator = part.indexOf('=');
+      if (separator === -1) return cookies;
+      const name = part.slice(0, separator).trim();
+      const value = part.slice(separator + 1).trim();
+      try {
+        cookies[name] = decodeURIComponent(value);
+      } catch {
+        cookies[name] = value;
+      }
+      return cookies;
+    }, {});
+}
+
+function base64UrlEncode(value) {
+  return Buffer.from(value).toString('base64url');
+}
+
+function base64UrlDecode(value) {
+  return Buffer.from(value, 'base64url').toString('utf8');
+}
+
+function getSessionSecret() {
+  if (ADMIN_SESSION_SECRET) return ADMIN_SESSION_SECRET;
+  return crypto.createHash('sha256').update(`${ADMIN_PASSWORD}:${SITE_NAME}:${SITE_URL}`).digest('hex');
+}
+
+function signValue(value) {
+  return crypto.createHmac('sha256', getSessionSecret()).update(value).digest('base64url');
+}
+
+function createAdminSession() {
+  const payload = {
+    csrf: crypto.randomBytes(24).toString('hex'),
+    exp: Date.now() + ADMIN_SESSION_TTL_MS,
+  };
+  const encoded = base64UrlEncode(JSON.stringify(payload));
+  return `${encoded}.${signValue(encoded)}`;
+}
+
+function safeEqualStrings(left, right) {
+  const leftBuffer = crypto.createHash('sha256').update(String(left || '')).digest();
+  const rightBuffer = crypto.createHash('sha256').update(String(right || '')).digest();
+  return crypto.timingSafeEqual(leftBuffer, rightBuffer);
+}
+
+function readAdminSession(token) {
+  if (!token || !token.includes('.')) return null;
+
+  const [encoded, signature] = token.split('.');
+  if (!encoded || !signature) return null;
+  if (!safeEqualStrings(signValue(encoded), signature)) return null;
+
+  try {
+    const payload = JSON.parse(base64UrlDecode(encoded));
+    if (!payload || typeof payload !== 'object') return null;
+    if (typeof payload.exp !== 'number' || payload.exp < Date.now()) return null;
+    if (typeof payload.csrf !== 'string' || payload.csrf.length < 16) return null;
+    return payload;
+  } catch {
+    return null;
+  }
+}
+
+function serializeCookie(name, value, options = {}) {
+  const parts = [`${name}=${encodeURIComponent(value)}`];
+  if (options.maxAge != null) parts.push(`Max-Age=${options.maxAge}`);
+  if (options.path) parts.push(`Path=${options.path}`);
+  if (options.httpOnly) parts.push('HttpOnly');
+  if (options.sameSite) parts.push(`SameSite=${options.sameSite}`);
+  if (options.secure) parts.push('Secure');
+  return parts.join('; ');
+}
+
+function setAdminSessionCookie(res, token) {
+  res.setHeader(
+    'Set-Cookie',
+    serializeCookie(ADMIN_SESSION_COOKIE, token, {
+      httpOnly: true,
+      maxAge: Math.floor(ADMIN_SESSION_TTL_MS / 1000),
+      path: '/',
+      sameSite: 'Strict',
+      secure: IS_PRODUCTION,
+    })
+  );
+}
+
+function clearAdminSessionCookie(res) {
+  res.setHeader(
+    'Set-Cookie',
+    serializeCookie(ADMIN_SESSION_COOKIE, '', {
+      httpOnly: true,
+      maxAge: 0,
+      path: '/',
+      sameSite: 'Strict',
+      secure: IS_PRODUCTION,
+    })
+  );
+}
+
+function getRequestIp(req) {
+  const forwarded = String(req.headers['x-forwarded-for'] || '').split(',')[0].trim();
+  return forwarded || req.socket.remoteAddress || 'unknown';
+}
+
+function pruneLoginAttempts(now = Date.now()) {
+  for (const [ip, entry] of loginAttempts.entries()) {
+    if (entry.resetAt <= now) {
+      loginAttempts.delete(ip);
+    }
+  }
+}
+
+function loginThrottleState(req) {
+  pruneLoginAttempts();
+  const ip = getRequestIp(req);
+  const current = loginAttempts.get(ip);
+  if (!current) return { ip, blocked: false, remainingMs: 0 };
+  if (current.count >= LOGIN_MAX_ATTEMPTS && current.resetAt > Date.now()) {
+    return { ip, blocked: true, remainingMs: current.resetAt - Date.now() };
+  }
+  return { ip, blocked: false, remainingMs: 0 };
+}
+
+function registerFailedLogin(req) {
+  const ip = getRequestIp(req);
+  const now = Date.now();
+  const current = loginAttempts.get(ip);
+  if (!current || current.resetAt <= now) {
+    loginAttempts.set(ip, { count: 1, resetAt: now + LOGIN_WINDOW_MS });
+    return;
+  }
+
+  current.count += 1;
+  loginAttempts.set(ip, current);
+}
+
+function clearFailedLogins(req) {
+  loginAttempts.delete(getRequestIp(req));
+}
+
+function currentRequestOrigin(req) {
+  const forwardedProto = String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim();
+  const forwardedHost = String(req.headers['x-forwarded-host'] || '').split(',')[0].trim();
+  const protocol = forwardedProto || req.protocol || (IS_PRODUCTION ? 'https' : 'http');
+  const host = forwardedHost || req.headers.host;
+  return host ? `${protocol}://${host}` : null;
+}
+
+function isTrustedOrigin(req) {
+  const candidate = req.headers.origin || req.headers.referer;
+  if (!candidate) return true;
+
+  try {
+    const requestOrigin = currentRequestOrigin(req);
+    if (!requestOrigin) return false;
+    return new URL(candidate).origin === requestOrigin;
+  } catch {
+    return false;
+  }
+}
+
+const categoryColors = {
+  product: { bg: '#e5f4ef', text: '#155e4b', border: '#b8dbce' },
+  engineering: { bg: '#eaf2fd', text: '#1952a6', border: '#c7daf7' },
+  company: { bg: '#fdf1dc', text: '#9a5b00', border: '#f2d8ab' },
+  customers: { bg: '#f8e9f1', text: '#9e255d', border: '#efc5da' },
+};
+
+function getCategoryColor(slug) {
+  return categoryColors[slug] || { bg: '#f3f4f6', text: '#475467', border: '#d0d5dd' };
+}
+
+function renderCategoryPill(name, slug) {
+  if (!name) return '';
+  const color = getCategoryColor(slug);
+  return `<span class="category-pill" style="background:${color.bg};color:${color.text};border-color:${color.border};">${escapeHtml(
+    name
+  )}</span>`;
+}
+
+function renderTagList(tags) {
+  if (!tags.length) return '';
+  return `<div class="tags">${tags.map((tag) => `<span class="tag">${escapeHtml(tag)}</span>`).join('')}</div>`;
+}
+
+function renderMeta(post) {
+  const date = formatDate(post.published_at || post.created_at);
+  const time = readingTime(post.content);
+  const pieces = [date, time].filter(Boolean);
+
+  return `
+    <div class="meta-row">
+      ${pieces
+        .map((piece, index) => `${index > 0 ? '<span class="dot"></span>' : ''}<span>${escapeHtml(piece)}</span>`)
+        .join('')}
+    </div>`;
+}
+
+function renderFeaturedPost(post) {
+  const tags = parseTags(post.tags);
+
+  return `
+    <article class="featured-post">
+      <div class="featured-label">Featured Story</div>
+      ${renderCategoryPill(post.category_name, post.category_slug)}
+      <h2><a href="/post/${escapeHtml(post.slug)}">${escapeHtml(post.title)}</a></h2>
+      ${renderMeta(post)}
+      <p class="featured-summary">${escapeHtml(post.excerpt || SITE_DESCRIPTION)}</p>
+      <div class="post-footer-bar">
+        ${renderTagList(tags)}
+        <a href="/post/${escapeHtml(post.slug)}" class="row-arrow">Read story</a>
+      </div>
+    </article>`;
+}
+
+function renderPostRow(post) {
+  const tags = parseTags(post.tags);
+  const date = formatDate(post.published_at || post.created_at);
+
+  return `
+    <article class="post-row">
+      <div class="post-row-date">${escapeHtml(date)}</div>
+      <div>
+        <div class="row-topline">
+          ${renderCategoryPill(post.category_name, post.category_slug)}
+          <span class="row-reading-time">${escapeHtml(readingTime(post.content))}</span>
+        </div>
+        <h3><a href="/post/${escapeHtml(post.slug)}">${escapeHtml(post.title)}</a></h3>
+        <p>${escapeHtml(post.excerpt || '')}</p>
+        ${renderTagList(tags)}
+      </div>
+      <a href="/post/${escapeHtml(post.slug)}" class="row-arrow">Read story</a>
+    </article>`;
+}
+
 function layout(title, content, options = {}) {
   const { description = '', ogType = 'website', ogImage = '', isAdmin = false } = options;
+  const safeTitle = escapeHtml(title);
+  const metaDescription = escapeHtml(description || title);
+  const publicLogo = `<span class="logo-mark"></span>${escapeHtml(SITE_NAME)}`;
+
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>${title} — ${SITE_NAME}</title>
-  <meta name="description" content="${description || title}">
-  <meta property="og:title" content="${title}">
-  <meta property="og:description" content="${description || title}">
-  <meta property="og:type" content="${ogType}">
-  <meta property="og:site_name" content="${SITE_NAME}">
-  ${ogImage ? `<meta property="og:image" content="${ogImage}">` : ''}
-  <link rel="alternate" type="application/rss+xml" title="${SITE_NAME} RSS" href="/rss">
+  <title>${safeTitle} — ${escapeHtml(SITE_NAME)}</title>
+  <meta name="description" content="${metaDescription}">
+  <meta property="og:title" content="${safeTitle}">
+  <meta property="og:description" content="${metaDescription}">
+  <meta property="og:type" content="${escapeHtml(ogType)}">
+  <meta property="og:site_name" content="${escapeHtml(SITE_NAME)}">
+  ${ogImage ? `<meta property="og:image" content="${safeUrl(ogImage)}">` : ''}
+  <link rel="alternate" type="application/rss+xml" title="${escapeHtml(SITE_NAME)} RSS" href="/rss">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Playfair+Display:wght@600;700;800&display=swap" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=Newsreader:opsz,wght@6..72,500;6..72,700&display=swap" rel="stylesheet">
   <style>
-    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    :root {
+      --bg: #f6f2ea;
+      --panel: #fffdf8;
+      --ink: #101828;
+      --muted: #667085;
+      --line: #d9d2c3;
+      --accent: #155e4b;
+      --accent-strong: #0f4a3b;
+      --accent-soft: #e7f3ef;
+      --danger: #b42318;
+      --danger-soft: #fef3f2;
+      --success: #027a48;
+      --success-soft: #ecfdf3;
+      --admin-ink: #0f172a;
+      --admin-line: #d8dee9;
+    }
+
+    *, *::before, *::after { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
     body {
-      font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-      line-height: 1.7; color: #0f172a; background: #f8fafc;
+      margin: 0;
+      font-family: 'Manrope', sans-serif;
+      line-height: 1.7;
+      color: var(--ink);
+      background: linear-gradient(180deg, #f8f5ee 0%, var(--bg) 260px, #f9f7f2 100%);
     }
-    a { color: #6366f1; text-decoration: none; transition: color 0.2s; }
-    a:hover { color: #4338ca; }
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { color: var(--accent-strong); }
 
-    /* ---- Navigation ---- */
     .site-nav {
-      background: #fff; border-bottom: 1px solid #e2e8f0; padding: 0;
-      position: sticky; top: 0; z-index: 100;
-      backdrop-filter: blur(12px); background: rgba(255,255,255,0.92);
+      position: sticky;
+      top: 0;
+      z-index: 100;
+      backdrop-filter: blur(14px);
+      background: rgba(248, 245, 238, 0.92);
+      border-bottom: 1px solid var(--line);
     }
-    .site-nav .nav-inner {
-      max-width: 1100px; margin: 0 auto; padding: 0 32px;
-      display: flex; align-items: center; justify-content: space-between;
-      height: 64px;
+    .nav-inner {
+      max-width: 1120px;
+      margin: 0 auto;
+      padding: 0 32px;
+      min-height: 72px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
     }
-    .site-nav .logo {
-      font-family: 'Playfair Display', Georgia, serif;
-      font-size: 22px; font-weight: 700; color: #0f172a;
-      letter-spacing: -0.02em;
+    .logo {
+      display: inline-flex;
+      align-items: center;
+      font-size: 13px;
+      font-weight: 800;
+      letter-spacing: 0.16em;
+      text-transform: uppercase;
+      color: var(--ink);
     }
-    .site-nav .logo:hover { color: #6366f1; }
-    .site-nav nav { display: flex; align-items: center; gap: 8px; }
+    .logo:hover { color: var(--accent-strong); }
+    .logo-mark {
+      width: 10px;
+      height: 10px;
+      border-radius: 999px;
+      margin-right: 10px;
+      background: var(--accent);
+      box-shadow: 0 0 0 6px rgba(21, 94, 75, 0.08);
+    }
+    .site-nav nav {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+    }
     .site-nav nav a {
-      font-size: 14px; color: #64748b; font-weight: 500;
-      padding: 8px 16px; border-radius: 8px; transition: all 0.2s;
+      padding: 10px 14px;
+      font-size: 14px;
+      font-weight: 600;
+      color: var(--muted);
+      border-radius: 999px;
+      transition: color 0.2s ease, background 0.2s ease;
     }
-    .site-nav nav a:hover { color: #0f172a; background: #f1f5f9; }
+    .site-nav nav a:hover { color: var(--ink); background: rgba(255, 255, 255, 0.7); }
     .site-nav nav a.nav-rss {
-      border: 1px solid #e2e8f0; color: #6366f1; font-weight: 600;
+      border: 1px solid var(--line);
+      color: var(--accent);
+      background: rgba(255, 255, 255, 0.72);
     }
-    .site-nav nav a.nav-rss:hover { background: #6366f1; color: #fff; border-color: #6366f1; }
-
-    /* ---- Hero ---- */
-    .hero {
-      background: linear-gradient(135deg, #0f172a 0%, #312e81 50%, #4f46e5 100%);
-      padding: 80px 32px 72px; text-align: center; position: relative; overflow: hidden;
-    }
-    .hero::before {
-      content: ''; position: absolute; top: -50%; left: -50%;
-      width: 200%; height: 200%;
-      background: radial-gradient(circle at 30% 70%, rgba(99,102,241,0.15) 0%, transparent 50%),
-                  radial-gradient(circle at 70% 30%, rgba(139,92,246,0.1) 0%, transparent 50%);
-    }
-    .hero-content { position: relative; z-index: 1; max-width: 700px; margin: 0 auto; }
-    .hero h1 {
-      font-family: 'Playfair Display', Georgia, serif;
-      font-size: 48px; font-weight: 800; color: #fff;
-      line-height: 1.15; letter-spacing: -0.02em; margin-bottom: 16px;
-    }
-    .hero p {
-      font-size: 18px; color: rgba(255,255,255,0.7); line-height: 1.6;
-      max-width: 520px; margin: 0 auto;
+    .site-nav nav a.nav-rss:hover {
+      color: #fff;
+      background: var(--accent);
+      border-color: var(--accent);
     }
 
-    /* ---- Container ---- */
-    .container { max-width: 1100px; margin: 0 auto; padding: 0 32px; }
-    .container--narrow { max-width: 780px; }
+    .container {
+      max-width: 1120px;
+      margin: 0 auto;
+      padding: 0 32px;
+    }
+    .container--narrow {
+      max-width: 860px;
+      margin: 0 auto;
+      padding: 0 32px;
+    }
+    main {
+      min-height: calc(100vh - 190px);
+      padding: 24px 0 72px;
+    }
 
-    /* ---- Main ---- */
-    main { padding: 48px 0 80px; min-height: 60vh; }
+    .page-intro {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(240px, 280px);
+      gap: 24px;
+      align-items: end;
+      padding: 40px 0 32px;
+      border-bottom: 1px solid var(--line);
+    }
+    .eyebrow {
+      display: inline-block;
+      margin-bottom: 16px;
+      font-size: 12px;
+      font-weight: 800;
+      letter-spacing: 0.18em;
+      text-transform: uppercase;
+      color: #7a6f61;
+    }
+    .page-intro h1,
+    .post-header h1,
+    .featured-post h2,
+    .post-row h3,
+    .page-title,
+    .login-box h1 {
+      margin: 0;
+      font-family: 'Newsreader', Georgia, serif;
+      letter-spacing: -0.03em;
+      color: var(--ink);
+    }
+    .page-intro h1 {
+      max-width: 10ch;
+      font-size: clamp(3rem, 8vw, 5.5rem);
+      line-height: 0.96;
+    }
+    .page-intro p {
+      max-width: 48rem;
+      margin: 18px 0 0;
+      font-size: 18px;
+      color: #475467;
+    }
+    .intro-note {
+      padding: 18px 20px;
+      border: 1px solid var(--line);
+      border-radius: 24px;
+      background: rgba(255, 255, 255, 0.7);
+      box-shadow: 0 16px 36px rgba(16, 24, 40, 0.05);
+    }
+    .intro-note strong {
+      display: block;
+      margin-bottom: 6px;
+      font-size: 13px;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      color: var(--accent);
+    }
+    .intro-note p {
+      margin: 0;
+      font-size: 14px;
+      color: var(--muted);
+    }
 
-    /* ---- Category Filter Bar ---- */
     .category-bar {
-      display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 40px;
-      padding-bottom: 24px; border-bottom: 1px solid #e2e8f0;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      padding: 22px 0 32px;
     }
     .category-bar a {
-      padding: 8px 20px; background: #fff; border: 1px solid #e2e8f0;
-      border-radius: 100px; font-size: 14px; font-weight: 500; color: #64748b;
-      transition: all 0.2s; white-space: nowrap;
+      padding: 10px 14px;
+      border-radius: 999px;
+      border: 1px solid var(--line);
+      font-size: 13px;
+      font-weight: 700;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      color: #6b7280;
+      background: rgba(255, 255, 255, 0.65);
     }
-    .category-bar a:hover { border-color: #6366f1; color: #6366f1; background: #eef2ff; }
+    .category-bar a:hover { color: var(--accent); border-color: #b8dbce; background: var(--accent-soft); }
     .category-bar a.active {
-      background: #6366f1; color: #fff; border-color: #6366f1;
-      box-shadow: 0 2px 8px rgba(99,102,241,0.3);
+      color: #fff;
+      background: var(--accent);
+      border-color: var(--accent);
     }
 
-    /* ---- Post Card Grid ---- */
-    .post-grid {
-      display: grid; grid-template-columns: repeat(2, 1fr); gap: 24px;
+    .featured-post {
+      padding: 36px;
+      border: 1px solid var(--line);
+      border-radius: 32px;
+      background: var(--panel);
+      box-shadow: 0 24px 48px rgba(16, 24, 40, 0.06);
+      margin-bottom: 40px;
     }
-    .post-card {
-      background: #fff; border-radius: 16px; padding: 32px;
-      border: 1px solid #e2e8f0; transition: all 0.3s ease;
-      display: flex; flex-direction: column;
+    .featured-label {
+      font-size: 12px;
+      font-weight: 800;
+      letter-spacing: 0.18em;
+      text-transform: uppercase;
+      color: #7a6f61;
+      margin-bottom: 14px;
     }
-    .post-card:hover {
-      box-shadow: 0 12px 40px rgba(15,23,42,0.08), 0 4px 12px rgba(15,23,42,0.04);
-      transform: translateY(-2px); border-color: #c7d2fe;
+    .featured-post h2 {
+      max-width: 12ch;
+      font-size: clamp(2.25rem, 5vw, 4rem);
+      line-height: 0.98;
+      margin: 18px 0;
     }
-    .post-card-top { margin-bottom: 16px; display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
-    .post-card .category-pill {
-      display: inline-block; padding: 4px 12px; border-radius: 100px;
-      font-size: 12px; font-weight: 600; letter-spacing: 0.02em;
+    .featured-post h2 a { color: var(--ink); }
+    .featured-post h2 a:hover { color: var(--accent-strong); }
+    .featured-summary {
+      max-width: 46rem;
+      font-size: 17px;
+      color: #344054;
+      margin: 18px 0 0;
+    }
+    .post-footer-bar {
+      margin-top: 22px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      flex-wrap: wrap;
+    }
+
+    .category-pill {
+      display: inline-flex;
+      align-items: center;
+      min-height: 34px;
+      padding: 6px 12px;
       border: 1px solid transparent;
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 800;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
     }
-    .post-card h2 {
-      font-family: 'Playfair Display', Georgia, serif;
-      font-size: 24px; font-weight: 700; line-height: 1.3;
-      margin-bottom: 12px; letter-spacing: -0.01em;
+    .meta-row {
+      display: flex;
+      align-items: center;
+      gap: 10px 12px;
+      flex-wrap: wrap;
+      color: var(--muted);
+      font-size: 14px;
+      margin: 18px 0 0;
     }
-    .post-card h2 a { color: #0f172a; }
-    .post-card h2 a:hover { color: #6366f1; }
-    .post-card .post-excerpt {
-      color: #64748b; font-size: 15px; line-height: 1.7;
-      margin-bottom: 20px; flex-grow: 1;
+    .dot {
+      width: 4px;
+      height: 4px;
+      border-radius: 999px;
+      background: #b6aca0;
     }
-    .post-card-footer {
-      display: flex; align-items: center; justify-content: space-between;
-      padding-top: 16px; border-top: 1px solid #f1f5f9;
-      font-size: 13px; color: #94a3b8;
+    .tags {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
     }
-    .post-card-footer .date-time { display: flex; align-items: center; gap: 8px; }
-    .post-card-footer .dot { width: 3px; height: 3px; border-radius: 50%; background: #cbd5e1; }
-    .post-card .tags { display: flex; gap: 6px; flex-wrap: wrap; }
-    .post-card .tag {
-      background: #f1f5f9; color: #64748b; padding: 2px 10px; border-radius: 100px;
-      font-size: 11px; font-weight: 500; letter-spacing: 0.01em;
+    .tag {
+      display: inline-flex;
+      align-items: center;
+      min-height: 30px;
+      padding: 6px 10px;
+      border-radius: 999px;
+      border: 1px solid #d6dfda;
+      background: #f8fcfa;
+      color: #34584f;
+      font-size: 12px;
+      font-weight: 700;
+    }
+    .post-section-title {
+      font-size: 12px;
+      font-weight: 800;
+      letter-spacing: 0.18em;
+      text-transform: uppercase;
+      color: #7a6f61;
+      margin: 0 0 12px;
+    }
+    .post-list {
+      border-top: 1px solid var(--line);
+    }
+    .post-row {
+      display: grid;
+      grid-template-columns: 160px minmax(0, 1fr) auto;
+      gap: 20px;
+      align-items: start;
+      padding: 24px 0;
+      border-bottom: 1px solid var(--line);
+    }
+    .post-row-date {
+      font-size: 13px;
+      font-weight: 700;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      color: #7a6f61;
+      padding-top: 4px;
+    }
+    .row-topline {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px 12px;
+      align-items: center;
+      margin-bottom: 12px;
+    }
+    .row-reading-time {
+      font-size: 13px;
+      font-weight: 700;
+      color: var(--muted);
+    }
+    .post-row h3 {
+      font-size: clamp(1.75rem, 3vw, 2.4rem);
+      line-height: 1.05;
+      margin-bottom: 12px;
+    }
+    .post-row h3 a { color: var(--ink); }
+    .post-row h3 a:hover { color: var(--accent-strong); }
+    .post-row p {
+      margin: 0 0 14px;
+      max-width: 40rem;
+      font-size: 15px;
+      color: #475467;
+    }
+    .row-arrow,
+    .back-link {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 13px;
+      font-weight: 800;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--accent);
+      white-space: nowrap;
+    }
+    .row-arrow:hover,
+    .back-link:hover { color: var(--accent-strong); }
+    .empty-state {
+      padding: 72px 24px;
+      border: 1px dashed var(--line);
+      border-radius: 28px;
+      text-align: center;
+      color: var(--muted);
+      background: rgba(255, 255, 255, 0.55);
+    }
+    .empty-state p {
+      margin: 0;
+      font-size: 16px;
     }
 
-    /* ---- Single Post ---- */
+    .post-shell { padding-top: 16px; }
     .post-header {
-      text-align: center; padding: 56px 0 40px; max-width: 720px; margin: 0 auto;
-    }
-    .post-header .category-pill {
-      display: inline-block; padding: 6px 16px; border-radius: 100px;
-      font-size: 13px; font-weight: 600; margin-bottom: 20px;
+      padding: 24px 0 28px;
+      border-bottom: 1px solid var(--line);
+      margin-bottom: 30px;
     }
     .post-header h1 {
-      font-family: 'Playfair Display', Georgia, serif;
-      font-size: 44px; font-weight: 800; line-height: 1.2;
-      color: #0f172a; letter-spacing: -0.02em; margin-bottom: 20px;
+      max-width: 14ch;
+      font-size: clamp(2.6rem, 6vw, 4.75rem);
+      line-height: 0.98;
+      margin: 18px 0;
     }
-    .post-header .post-meta-line {
-      font-size: 15px; color: #94a3b8; display: flex; align-items: center;
-      justify-content: center; gap: 12px;
+    .post-subtitle {
+      max-width: 44rem;
+      margin: 18px 0 0;
+      font-size: 18px;
+      color: #475467;
     }
-    .post-header .post-meta-line .dot { width: 4px; height: 4px; border-radius: 50%; background: #cbd5e1; }
     .post-content {
-      background: #fff; border-radius: 20px; padding: 56px 64px;
-      border: 1px solid #e2e8f0; max-width: 780px; margin: 0 auto;
-      box-shadow: 0 1px 3px rgba(15,23,42,0.04);
+      font-size: 18px;
+      color: #1f2937;
     }
-    .post-content h1 { font-family: 'Playfair Display', Georgia, serif; font-size: 36px; margin-bottom: 16px; line-height: 1.3; color: #0f172a; }
-    .post-content h2 { font-family: 'Playfair Display', Georgia, serif; font-size: 28px; margin: 40px 0 16px; color: #0f172a; font-weight: 700; }
-    .post-content h3 { font-size: 20px; margin: 32px 0 12px; color: #1e293b; font-weight: 600; }
-    .post-content p { margin: 20px 0; color: #334155; font-size: 18px; line-height: 1.8; }
-    .post-content ul, .post-content ol { margin: 20px 0 20px 28px; }
-    .post-content li { margin: 8px 0; color: #334155; font-size: 18px; line-height: 1.8; }
-    .post-content code { background: #f1f5f9; padding: 3px 8px; border-radius: 6px; font-size: 15px; color: #6366f1; }
-    .post-content pre { background: #0f172a; color: #e2e8f0; padding: 24px; border-radius: 12px; overflow-x: auto; margin: 28px 0; }
-    .post-content pre code { background: none; color: inherit; padding: 0; }
-    .post-content hr { border: none; border-top: 1px solid #e2e8f0; margin: 40px 0; }
-    .post-content a { color: #6366f1; border-bottom: 1px solid rgba(99,102,241,0.3); transition: border-color 0.2s; }
-    .post-content a:hover { border-bottom-color: #6366f1; }
-    .post-content strong { font-weight: 600; color: #0f172a; }
+    .post-content h1 {
+      margin: 36px 0 16px;
+      font-family: 'Newsreader', Georgia, serif;
+      font-size: 38px;
+      line-height: 1.1;
+      letter-spacing: -0.02em;
+    }
+    .post-content h2 {
+      margin: 40px 0 16px;
+      font-family: 'Newsreader', Georgia, serif;
+      font-size: 30px;
+      line-height: 1.14;
+      letter-spacing: -0.02em;
+    }
+    .post-content h3 {
+      margin: 28px 0 12px;
+      font-size: 20px;
+      line-height: 1.3;
+      font-weight: 800;
+    }
+    .post-content p,
+    .post-content li {
+      color: #1f2937;
+      line-height: 1.85;
+    }
+    .post-content p { margin: 18px 0; }
+    .post-content ul,
+    .post-content ol { margin: 16px 0 16px 26px; }
+    .post-content li { margin: 8px 0; }
+    .post-content strong { font-weight: 800; color: var(--ink); }
+    .post-content code {
+      padding: 2px 7px;
+      border-radius: 8px;
+      background: rgba(15, 23, 42, 0.06);
+      color: var(--accent-strong);
+      font-size: 15px;
+    }
+    .post-content pre {
+      margin: 28px 0;
+      padding: 24px;
+      border-radius: 20px;
+      background: #0f172a;
+      color: #e2e8f0;
+      overflow-x: auto;
+    }
+    .post-content pre code {
+      padding: 0;
+      background: none;
+      color: inherit;
+      font-size: 14px;
+    }
+    .post-content hr {
+      border: 0;
+      border-top: 1px solid var(--line);
+      margin: 36px 0;
+    }
+    .post-content a {
+      color: var(--accent-strong);
+      border-bottom: 1px solid rgba(21, 94, 75, 0.24);
+    }
+    .post-content a:hover { border-bottom-color: var(--accent-strong); }
     .post-content blockquote {
-      border-left: 3px solid #6366f1; padding: 16px 24px; margin: 28px 0;
-      background: #f8fafc; border-radius: 0 12px 12px 0;
+      margin: 28px 0;
+      padding: 6px 0 6px 20px;
+      border-left: 3px solid #9ac7ba;
+      color: #475467;
     }
-    .post-content blockquote p { color: #475569; font-style: italic; }
-
-    .back-link {
-      display: flex; align-items: center; justify-content: center; gap: 8px;
-      margin-top: 48px; font-size: 15px; font-weight: 500; color: #6366f1;
+    .post-content blockquote p { margin: 0; }
+    .embed-block { margin: 34px 0; }
+    .embed-shell {
+      position: relative;
+      padding-top: 56.25%;
+      overflow: hidden;
+      border-radius: 22px;
+      border: 1px solid var(--line);
+      background: #101828;
+      box-shadow: 0 20px 44px rgba(16, 24, 40, 0.12);
     }
-    .back-link:hover { color: #4338ca; }
+    .embed-shell iframe,
+    .embed-shell video {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      display: block;
+      border: 0;
+      object-fit: cover;
+      background: #101828;
+    }
+    .embed-caption {
+      margin: 12px 0 0;
+      font-size: 14px;
+      color: var(--muted);
+      text-align: center;
+    }
+    .image-embed {
+      margin: 34px 0;
+    }
+    .image-embed img {
+      display: block;
+      width: 100%;
+      border-radius: 22px;
+      border: 1px solid var(--line);
+      background: #fff;
+      box-shadow: 0 20px 44px rgba(16, 24, 40, 0.08);
+    }
+    .image-embed .embed-caption {
+      margin-top: 12px;
+    }
+    .post-footer {
+      margin-top: 34px;
+      padding-top: 24px;
+      border-top: 1px solid var(--line);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      flex-wrap: wrap;
+    }
 
-    /* ---- Footer ---- */
     footer {
-      background: #0f172a; padding: 48px 0; text-align: center; margin-top: 40px;
+      margin-top: 56px;
+      border-top: 1px solid var(--line);
+      padding: 28px 0 40px;
     }
-    footer .footer-name {
-      font-family: 'Playfair Display', Georgia, serif;
-      font-size: 18px; font-weight: 700; color: #fff; margin-bottom: 12px;
+    .footer-inner {
+      display: flex;
+      justify-content: space-between;
+      gap: 18px;
+      flex-wrap: wrap;
     }
-    footer .footer-powered {
-      font-size: 14px; color: #64748b;
+    .footer-name {
+      font-size: 13px;
+      font-weight: 800;
+      letter-spacing: 0.16em;
+      text-transform: uppercase;
+      color: var(--ink);
     }
-    footer .footer-powered a { color: #818cf8; }
-    footer .footer-powered a:hover { color: #a5b4fc; }
-    footer .footer-copy { font-size: 13px; color: #475569; margin-top: 8px; }
+    .footer-copy,
+    .footer-links {
+      font-size: 14px;
+      color: var(--muted);
+    }
+    .footer-links a { color: var(--accent); }
 
-    /* ---- Buttons ---- */
-    .btn { display: inline-block; padding: 10px 24px; background: #6366f1; color: #fff; border: none; border-radius: 8px; font-size: 15px; font-weight: 600; cursor: pointer; transition: all 0.2s; }
-    .btn:hover { background: #4338ca; color: #fff; transform: translateY(-1px); box-shadow: 0 4px 12px rgba(99,102,241,0.3); }
-    .btn-danger { background: #ef4444; }
-    .btn-danger:hover { background: #dc2626; box-shadow: 0 4px 12px rgba(239,68,68,0.3); }
-    .btn-sm { padding: 6px 16px; font-size: 13px; }
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 44px;
+      padding: 0 18px;
+      border: 0;
+      border-radius: 12px;
+      background: var(--accent);
+      color: #fff;
+      font-size: 14px;
+      font-weight: 800;
+      cursor: pointer;
+    }
+    .btn:hover {
+      color: #fff;
+      background: var(--accent-strong);
+    }
+    .btn-danger {
+      background: var(--danger);
+    }
+    .btn-danger:hover {
+      background: #912018;
+    }
+    .btn-sm {
+      min-height: 36px;
+      padding: 0 14px;
+      font-size: 13px;
+    }
+    .btn-secondary {
+      background: #667085;
+    }
+    .btn-secondary:hover {
+      background: #475467;
+    }
 
-    /* ---- Admin styles ---- */
-    .admin-header { background: #0f172a !important; border-bottom-color: #1e293b !important; }
-    .admin-header .logo { color: #fff !important; }
-    .admin-header nav a { color: #94a3b8 !important; }
-    .admin-header nav a:hover { color: #fff !important; background: #1e293b !important; }
-    .admin-table { width: 100%; border-collapse: collapse; background: #fff; border-radius: 12px; overflow: hidden; border: 1px solid #e2e8f0; }
-    .admin-table th { background: #f8fafc; text-align: left; padding: 14px 16px; font-size: 12px; font-weight: 600; color: #64748b; text-transform: uppercase; letter-spacing: 0.05em; }
-    .admin-table td { padding: 14px 16px; border-top: 1px solid #f1f5f9; font-size: 15px; }
-    .admin-table tr:hover td { background: #f8fafc; }
-    .form-group { margin-bottom: 20px; }
-    .form-group label { display: block; font-size: 14px; font-weight: 600; color: #1e293b; margin-bottom: 6px; }
-    .form-group input, .form-group textarea, .form-group select {
-      width: 100%; padding: 10px 14px; border: 1px solid #e2e8f0; border-radius: 8px;
-      font-size: 15px; font-family: inherit; background: #fff; color: #0f172a;
-      transition: all 0.2s;
+    .admin-header {
+      background: rgba(15, 23, 42, 0.96) !important;
+      border-bottom-color: #1f2937 !important;
     }
-    .form-group textarea { min-height: 300px; line-height: 1.6; }
-    .form-group input:focus, .form-group textarea:focus, .form-group select:focus {
-      outline: none; border-color: #6366f1; box-shadow: 0 0 0 3px rgba(99,102,241,0.1);
+    .admin-header .logo,
+    .admin-header nav a.nav-rss {
+      color: #fff !important;
     }
-    .login-box { max-width: 400px; margin: 80px auto; background: #fff; padding: 40px; border-radius: 16px; border: 1px solid #e2e8f0; box-shadow: 0 4px 24px rgba(15,23,42,0.06); }
-    .login-box h1 { font-family: 'Playfair Display', Georgia, serif; font-size: 24px; text-align: center; margin-bottom: 24px; color: #0f172a; }
-    .alert { padding: 12px 16px; border-radius: 8px; margin-bottom: 20px; font-size: 14px; }
-    .alert-error { background: #fef2f2; color: #dc2626; border: 1px solid #fecaca; }
-    .alert-success { background: #f0fdf4; color: #16a34a; border: 1px solid #bbf7d0; }
-    .page-title { font-family: 'Playfair Display', Georgia, serif; font-size: 32px; margin-bottom: 8px; color: #0f172a; }
-    .page-subtitle { color: #64748b; font-size: 16px; margin-bottom: 32px; }
-    .checkbox-group { display: flex; align-items: center; gap: 8px; }
+    .admin-header .logo-mark { background: #a7f3d0; box-shadow: 0 0 0 6px rgba(167, 243, 208, 0.12); }
+    .admin-header nav a { color: #cbd5e1 !important; }
+    .admin-header nav a:hover { color: #fff !important; background: rgba(255, 255, 255, 0.08) !important; }
+
+    .admin-table {
+      width: 100%;
+      border-collapse: collapse;
+      background: rgba(255, 255, 255, 0.88);
+      border: 1px solid var(--admin-line);
+      border-radius: 18px;
+      overflow: hidden;
+    }
+    .admin-table th {
+      text-align: left;
+      padding: 14px 16px;
+      background: #f8fafc;
+      color: #475467;
+      font-size: 12px;
+      font-weight: 800;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+    .admin-table td {
+      padding: 14px 16px;
+      border-top: 1px solid #edf2f7;
+      font-size: 15px;
+      color: var(--admin-ink);
+      vertical-align: top;
+    }
+    .admin-table tr:hover td { background: #fcfdff; }
+    .page-title {
+      font-size: 40px;
+      line-height: 1;
+    }
+    .page-subtitle {
+      margin: 8px 0 0;
+      color: var(--muted);
+      font-size: 16px;
+    }
+    .form-group {
+      margin-bottom: 18px;
+    }
+    .form-group label {
+      display: block;
+      margin-bottom: 7px;
+      font-size: 14px;
+      font-weight: 800;
+      color: var(--admin-ink);
+    }
+    .form-group input,
+    .form-group textarea,
+    .form-group select {
+      width: 100%;
+      padding: 12px 14px;
+      border-radius: 12px;
+      border: 1px solid var(--admin-line);
+      background: rgba(255, 255, 255, 0.9);
+      color: var(--admin-ink);
+      font: inherit;
+    }
+    .form-group textarea {
+      min-height: 340px;
+      line-height: 1.6;
+      resize: vertical;
+    }
+    .form-group input:focus,
+    .form-group textarea:focus,
+    .form-group select:focus {
+      outline: none;
+      border-color: #7fc6b3;
+      box-shadow: 0 0 0 4px rgba(21, 94, 75, 0.09);
+    }
+    .checkbox-group {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
     .checkbox-group input[type="checkbox"] { width: auto; }
-    .actions { display: flex; gap: 8px; }
-    .empty-state {
-      text-align: center; padding: 64px 24px; color: #94a3b8;
-      grid-column: 1 / -1;
+    .actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
     }
-    .empty-state p { font-size: 16px; }
+    .alert {
+      padding: 12px 14px;
+      border-radius: 12px;
+      margin-bottom: 18px;
+      font-size: 14px;
+      font-weight: 700;
+    }
+    .alert-error {
+      background: var(--danger-soft);
+      color: var(--danger);
+      border: 1px solid #fecdca;
+    }
+    .alert-success {
+      background: var(--success-soft);
+      color: var(--success);
+      border: 1px solid #abefc6;
+    }
+    .login-box {
+      max-width: 440px;
+      margin: 56px auto 0;
+      padding: 34px;
+      border-radius: 24px;
+      border: 1px solid var(--admin-line);
+      background: rgba(255, 255, 255, 0.88);
+      box-shadow: 0 24px 48px rgba(16, 24, 40, 0.06);
+    }
+    .login-box h1 {
+      font-size: 34px;
+      margin-bottom: 20px;
+      text-align: center;
+    }
+    .notes-card {
+      margin-bottom: 18px;
+      padding: 16px 18px;
+      border-radius: 16px;
+      border: 1px solid var(--admin-line);
+      background: #f8fafc;
+    }
+    .notes-card strong {
+      display: block;
+      font-size: 13px;
+      font-weight: 800;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: #334155;
+    }
+    .notes-card p {
+      margin: 10px 0 0;
+      font-size: 14px;
+      color: #475569;
+    }
+    .notes-card code,
+    .form-help code {
+      padding: 2px 6px;
+      border-radius: 8px;
+      background: #e2e8f0;
+      font-size: 12px;
+    }
+    .form-help {
+      margin-top: 8px;
+      font-size: 13px;
+      color: var(--muted);
+    }
+    .admin-grid {
+      display: grid;
+      grid-template-columns: minmax(0, 360px) minmax(0, 1fr);
+      gap: 20px;
+      margin-bottom: 24px;
+      align-items: start;
+    }
+    .admin-card {
+      padding: 22px;
+      border-radius: 18px;
+      border: 1px solid var(--admin-line);
+      background: rgba(255, 255, 255, 0.9);
+    }
+    .admin-card h2 {
+      margin: 0 0 8px;
+      font-size: 18px;
+      font-weight: 800;
+      color: var(--admin-ink);
+    }
+    .admin-card p {
+      margin: 0;
+      color: var(--muted);
+      font-size: 14px;
+    }
+    .media-chip {
+      display: inline-flex;
+      align-items: center;
+      min-height: 28px;
+      padding: 4px 10px;
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 800;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      border: 1px solid transparent;
+    }
+    .media-chip--video {
+      color: #9e255d;
+      background: #fdf2f8;
+      border-color: #f4b8d2;
+    }
+    .media-chip--image {
+      color: #1952a6;
+      background: #eff6ff;
+      border-color: #bfdbfe;
+    }
+    .media-chip--file {
+      color: #475467;
+      background: #f8fafc;
+      border-color: #d0d5dd;
+    }
+    .media-code {
+      display: block;
+      margin-top: 8px;
+      padding: 10px 12px;
+      border-radius: 12px;
+      background: #f8fafc;
+      border: 1px solid #e2e8f0;
+      color: #334155;
+      font-size: 12px;
+      line-height: 1.5;
+      overflow-wrap: anywhere;
+    }
+    .stat-pills {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-top: 16px;
+    }
+    .stat-pill {
+      display: inline-flex;
+      align-items: center;
+      min-height: 36px;
+      padding: 8px 12px;
+      border-radius: 999px;
+      background: #f8fafc;
+      border: 1px solid #e2e8f0;
+      color: #334155;
+      font-size: 13px;
+      font-weight: 700;
+    }
 
-    /* ---- Responsive ---- */
-    @media (max-width: 768px) {
-      .hero { padding: 56px 24px 48px; }
-      .hero h1 { font-size: 32px; }
-      .hero p { font-size: 16px; }
-      .post-grid { grid-template-columns: 1fr; }
-      .post-content { padding: 32px 24px; }
-      .post-header h1 { font-size: 32px; }
-      .site-nav .nav-inner { padding: 0 20px; }
-      .container { padding: 0 20px; }
+    @media (max-width: 900px) {
+      .page-intro,
+      .post-row,
+      .admin-grid {
+        grid-template-columns: 1fr;
+      }
+      .post-row-date {
+        padding-top: 0;
+      }
+      .row-arrow {
+        justify-self: start;
+      }
     }
-    @media (max-width: 480px) {
-      .site-nav .nav-inner { height: 56px; }
-      .site-nav nav a { padding: 6px 12px; font-size: 13px; }
-      .post-card { padding: 24px; }
-      .post-card h2 { font-size: 20px; }
-      .hero h1 { font-size: 28px; }
+
+    @media (max-width: 720px) {
+      .nav-inner,
+      .container,
+      .container--narrow {
+        padding-left: 20px;
+        padding-right: 20px;
+      }
+      .featured-post {
+        padding: 26px;
+      }
+      .page-intro h1 {
+        max-width: 100%;
+      }
+      .post-header h1 {
+        max-width: 100%;
+      }
+      .post-footer,
+      .post-footer-bar,
+      .footer-inner {
+        align-items: flex-start;
+      }
+    }
+
+    @media (max-width: 520px) {
+      .site-nav {
+        position: static;
+      }
+      .nav-inner {
+        min-height: 0;
+        padding-top: 16px;
+        padding-bottom: 16px;
+        flex-direction: column;
+        align-items: flex-start;
+      }
+      .site-nav nav {
+        width: 100%;
+        justify-content: flex-start;
+      }
+      .page-intro {
+        padding-top: 26px;
+      }
+      .featured-post,
+      .login-box {
+        padding: 22px;
+      }
+      .admin-table {
+        display: block;
+        overflow-x: auto;
+      }
     }
   </style>
 </head>
 <body>
   <header class="site-nav${isAdmin ? ' admin-header' : ''}">
     <div class="nav-inner">
-      <a href="${isAdmin ? '/admin' : '/'}" class="logo">${isAdmin ? 'Blog Admin' : SITE_NAME}</a>
+      <a href="${isAdmin ? '/admin' : '/'}" class="logo">${isAdmin ? 'Blog Admin' : publicLogo}</a>
       <nav>
         ${isAdmin ? `
           <a href="/admin">Posts</a>
           <a href="/admin/categories">Categories</a>
-          <a href="/" target="_blank">View Blog</a>
+          <a href="/admin/media">Media</a>
+          <a href="/" target="_blank" rel="noreferrer">View Blog</a>
           <a href="/admin/logout">Logout</a>
         ` : `
           <a href="/">Home</a>
@@ -378,28 +1591,113 @@ function layout(title, content, options = {}) {
   ${isAdmin ? `<main><div class="container">${content}</div></main>` : content}
   <footer>
     <div class="container">
-      <div class="footer-name">${SITE_NAME}</div>
-      <div class="footer-powered">Powered by <a href="https://dailey.cloud">Dailey OS</a> &middot; <a href="/admin">Admin</a></div>
-      <div class="footer-copy">&copy; ${new Date().getFullYear()} ${SITE_NAME}. All rights reserved.</div>
+      <div class="footer-inner">
+        <div>
+          <div class="footer-name">${escapeHtml(SITE_NAME)}</div>
+          <div class="footer-copy">&copy; ${new Date().getFullYear()} ${escapeHtml(SITE_NAME)}. All rights reserved.</div>
+        </div>
+        <div class="footer-links">
+          Official publishing surface for Dailey, hosted on <a href="https://dailey.cloud" target="_blank" rel="noreferrer">Dailey OS</a>
+          with <a href="/admin">the built-in editor</a>.
+        </div>
+      </div>
     </div>
   </footer>
 </body>
 </html>`;
 }
 
-// Admin auth middleware
 function adminAuth(req, res, next) {
-  if (req.headers.cookie && req.headers.cookie.includes('blog_admin=1')) {
+  res.setHeader('Cache-Control', 'no-store');
+  const cookies = parseCookies(req.headers.cookie);
+  const session = readAdminSession(cookies[ADMIN_SESSION_COOKIE]);
+  if (session) {
+    req.adminSession = session;
     return next();
   }
+
+  clearAdminSessionCookie(res);
   res.redirect('/admin/login');
 }
 
-// =====================
-// PUBLIC ROUTES
-// =====================
+function requireTrustedOrigin(req, res, next) {
+  if (isTrustedOrigin(req)) return next();
+  res.status(403).send(layout('Forbidden', '<p>Request origin not allowed.</p>', { isAdmin: true }));
+}
 
-// Home page — list published posts
+function requireAdminCsrf(req, res, next) {
+  if (!req.adminSession) {
+    return res.status(403).send(layout('Forbidden', '<p>Admin session missing.</p>', { isAdmin: true }));
+  }
+
+  if (safeEqualStrings(req.body.csrf_token, req.adminSession.csrf)) {
+    return next();
+  }
+
+  res.status(403).send(layout('Forbidden', '<p>Security token mismatch.</p>', { isAdmin: true }));
+}
+
+function handleMediaUpload(req, res, next) {
+  upload.single('file')(req, res, (err) => {
+    if (!err) return next();
+
+    const message =
+      err instanceof multer.MulterError && err.code === 'LIMIT_FILE_SIZE'
+        ? `Upload failed. Files must be ${Math.round(MEDIA_UPLOAD_MAX_BYTES / (1024 * 1024))} MB or smaller.`
+        : err.message || 'Upload failed.';
+
+    res.redirect(`/admin/media?error=${encodeURIComponent(message)}`);
+  });
+}
+
+function requireStorageForAdmin(req, res, next) {
+  if (hasStorageConfig()) return next();
+  res.redirect('/admin/media?error=Storage%20is%20not%20configured%20for%20this%20deployment.');
+}
+
+app.get('/media/:id/:filename?', async (req, res) => {
+  try {
+    const db = await getPool();
+    const [assets] = await db.execute('SELECT * FROM media_assets WHERE id = ?', [req.params.id]);
+
+    if (assets.length === 0) {
+      return res
+        .status(404)
+        .send(layout('Not Found', '<main><div class="container"><div class="empty-state"><p>Media asset not found.</p></div></div></main>'));
+    }
+
+    if (!hasStorageConfig()) {
+      return res
+        .status(503)
+        .send(
+          layout(
+            'Storage Unavailable',
+            '<main><div class="container"><div class="empty-state"><p>Media storage is not configured for this deployment yet.</p></div></div></main>'
+          )
+        );
+    }
+
+    const asset = assets[0];
+    const signedUrl = await getSignedUrl(
+      getStorageClient(),
+      new GetObjectCommand({
+        Bucket: STORAGE_BUCKET,
+        Key: asset.storage_key,
+        ResponseContentDisposition: `inline; filename="${safeDownloadFilename(asset.original_name)}"`,
+        ResponseContentType: asset.mime_type,
+      }),
+      { expiresIn: 3600 }
+    );
+
+    res.redirect(signedUrl);
+  } catch (err) {
+    console.error(err);
+    res
+      .status(500)
+      .send(layout('Error', '<main><div class="container"><div class="empty-state"><p>Media could not be loaded.</p></div></div></main>'));
+  }
+});
+
 app.get('/', async (req, res) => {
   try {
     const db = await getPool();
@@ -408,135 +1706,154 @@ app.get('/', async (req, res) => {
       FROM posts p LEFT JOIN categories c ON p.category_id = c.id
       WHERE p.published = TRUE`;
     const params = [];
+
     if (category) {
       query += ' AND c.slug = ?';
       params.push(category);
     }
+
     query += ' ORDER BY p.published_at DESC';
+
     const [posts] = await db.execute(query, params);
     const [categories] = await db.execute('SELECT * FROM categories ORDER BY name');
 
-    const postsHtml = posts.map(p => {
-      const tags = (typeof p.tags === 'string' ? JSON.parse(p.tags) : p.tags) || [];
-      const date = p.published_at ? new Date(p.published_at).toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' }) : '';
-      const rTime = readingTime(p.content);
-      const cc = getCategoryColor(p.category_slug);
-      return `
-        <article class="post-card">
-          <div class="post-card-top">
-            ${p.category_name ? `<span class="category-pill" style="background:${cc.bg};color:${cc.text};border-color:${cc.border};">${p.category_name}</span>` : ''}
-          </div>
-          <h2><a href="/post/${p.slug}">${p.title}</a></h2>
-          <p class="post-excerpt">${p.excerpt || ''}</p>
-          <div class="post-card-footer">
-            <div class="date-time">
-              <span>${date}</span>
-              <span class="dot"></span>
-              <span>${rTime}</span>
-            </div>
-            ${tags.length > 0 ? `<div class="tags">${tags.map(t => `<span class="tag">${t}</span>`).join('')}</div>` : ''}
-          </div>
-        </article>`;
-    }).join('');
+    const featuredPost = posts[0] || null;
+    const otherPosts = featuredPost ? posts.slice(1) : [];
+    const categoryLinks = categories
+      .map(
+        (c) =>
+          `<a href="/?category=${escapeHtml(c.slug)}" class="${category === c.slug ? 'active' : ''}">${escapeHtml(
+            c.name
+          )}</a>`
+      )
+      .join('');
 
-    const categoryLinks = categories.map(c =>
-      `<a href="/?category=${c.slug}" class="${category === c.slug ? 'active' : ''}">${c.name}</a>`
-    ).join('');
-
-    const heroHtml = `
-      <section class="hero">
-        <div class="hero-content">
-          <h1>${SITE_NAME}</h1>
-          <p>Product updates, engineering deep-dives, and company news</p>
+    const introHtml = `
+      <section class="page-intro">
+        <div>
+          <span class="eyebrow">Official Company Blog</span>
+          <h1>${escapeHtml(SITE_NAME)}</h1>
+          <p>${escapeHtml(SITE_DESCRIPTION)}</p>
         </div>
+        <aside class="intro-note">
+          <strong>Video-ready publishing</strong>
+          <p>Built for launch notes, engineering explainers, company updates, and embedded product video.</p>
+        </aside>
       </section>`;
 
-    const contentHtml = `
+    const featuredHtml = featuredPost ? renderFeaturedPost(featuredPost) : '';
+    const listHtml = otherPosts.length
+      ? `
+        <section>
+          <h2 class="post-section-title">Latest Stories</h2>
+          <div class="post-list">${otherPosts.map(renderPostRow).join('')}</div>
+        </section>`
+      : featuredPost
+        ? ''
+        : '<div class="empty-state"><p>No posts yet. Check back soon.</p></div>';
+
+    const html = `
       <main>
         <div class="container">
+          ${introHtml}
           <div class="category-bar">
             <a href="/" class="${!category ? 'active' : ''}">All Posts</a>
             ${categoryLinks}
           </div>
-          <div class="post-grid">
-            ${posts.length > 0 ? postsHtml : '<div class="empty-state"><p>No posts yet. Check back soon.</p></div>'}
-          </div>
+          ${featuredHtml}
+          ${listHtml}
         </div>
       </main>`;
 
-    const html = heroHtml + contentHtml;
-    res.send(layout(SITE_NAME, html, { description: 'Thoughts, tutorials, and insights' }));
+    res.send(layout(SITE_NAME, html, { description: SITE_DESCRIPTION }));
   } catch (err) {
     console.error(err);
-    res.status(500).send(layout('Error', '<main><div class="container"><p>Something went wrong.</p></div></main>'));
+    res
+      .status(500)
+      .send(layout('Error', '<main><div class="container"><div class="empty-state"><p>Blog data is not available yet. Check your database connection and try again.</p></div></div></main>'));
   }
 });
 
-// Single post
 app.get('/post/:slug', async (req, res) => {
   try {
     const db = await getPool();
     const [posts] = await db.execute(
       `SELECT p.*, c.name as category_name, c.slug as category_slug
        FROM posts p LEFT JOIN categories c ON p.category_id = c.id
-       WHERE p.slug = ? AND p.published = TRUE`, [req.params.slug]
+       WHERE p.slug = ? AND p.published = TRUE`,
+      [req.params.slug]
     );
-    if (posts.length === 0) return res.status(404).send(layout('Not Found', '<main><div class="container"><p style="text-align:center;padding:64px 0;color:#94a3b8;">Post not found.</p></div></main>'));
-    const p = posts[0];
-    const tags = (typeof p.tags === 'string' ? JSON.parse(p.tags) : p.tags) || [];
-    const date = p.published_at ? new Date(p.published_at).toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' }) : '';
 
-    const rTime = readingTime(p.content);
-    const cc = getCategoryColor(p.category_slug);
+    if (posts.length === 0) {
+      return res
+        .status(404)
+        .send(
+          layout(
+            'Not Found',
+            '<main><div class="container"><div class="empty-state"><p>Post not found.</p></div></div></main>'
+          )
+        );
+    }
+
+    const post = posts[0];
+    const tags = parseTags(post.tags);
     const html = `
       <main>
-        <div class="container container--narrow">
-          <div class="post-header">
-            ${p.category_name ? `<span class="category-pill" style="background:${cc.bg};color:${cc.text};">${p.category_name}</span>` : ''}
-            <h1>${p.title}</h1>
-            <div class="post-meta-line">
-              <span>${date}</span>
-              <span class="dot"></span>
-              <span>${rTime}</span>
-            </div>
-          </div>
+        <div class="container--narrow post-shell">
+          <header class="post-header">
+            ${renderCategoryPill(post.category_name, post.category_slug)}
+            <h1>${escapeHtml(post.title)}</h1>
+            ${renderMeta(post)}
+            ${post.excerpt ? `<p class="post-subtitle">${escapeHtml(post.excerpt)}</p>` : ''}
+          </header>
           <article class="post-content">
-            ${renderMarkdown(p.content)}
+            ${renderMarkdown(post.content)}
           </article>
-          <a href="/" class="back-link">&larr; Back to all posts</a>
+          <div class="post-footer">
+            ${renderTagList(tags)}
+            <a href="/" class="back-link">Back to all posts</a>
+          </div>
         </div>
       </main>`;
-    res.send(layout(p.title, html, { description: p.excerpt || '', ogType: 'article' }));
+
+    res.send(layout(post.title, html, { description: post.excerpt || SITE_DESCRIPTION, ogType: 'article' }));
   } catch (err) {
     console.error(err);
-    res.status(500).send(layout('Error', '<main><div class="container"><p>Something went wrong.</p></div></main>'));
+    res
+      .status(500)
+      .send(layout('Error', '<main><div class="container"><div class="empty-state"><p>Something went wrong.</p></div></div></main>'));
   }
 });
 
-// RSS Feed
-app.get('/rss', async (req, res) => {
+app.get('/rss', async (_req, res) => {
   try {
     const db = await getPool();
     const [posts] = await db.execute(
-      `SELECT p.*, c.name as category_name FROM posts p LEFT JOIN categories c ON p.category_id = c.id
+      `SELECT p.*, c.name as category_name
+       FROM posts p LEFT JOIN categories c ON p.category_id = c.id
        WHERE p.published = TRUE ORDER BY p.published_at DESC LIMIT 20`
     );
-    const items = posts.map(p => `
+
+    const items = posts
+      .map(
+        (post) => `
     <item>
-      <title><![CDATA[${p.title}]]></title>
-      <link>${SITE_URL}/post/${p.slug}</link>
-      <guid>${SITE_URL}/post/${p.slug}</guid>
-      <description><![CDATA[${p.excerpt || ''}]]></description>
-      ${p.category_name ? `<category>${p.category_name}</category>` : ''}
-      <pubDate>${p.published_at ? new Date(p.published_at).toUTCString() : ''}</pubDate>
-    </item>`).join('');
+      <title><![CDATA[${post.title}]]></title>
+      <link>${SITE_URL}/post/${post.slug}</link>
+      <guid>${SITE_URL}/post/${post.slug}</guid>
+      <description><![CDATA[${post.excerpt || ''}]]></description>
+      ${post.category_name ? `<category>${post.category_name}</category>` : ''}
+      <pubDate>${post.published_at ? new Date(post.published_at).toUTCString() : ''}</pubDate>
+    </item>`
+      )
+      .join('');
 
     res.type('application/rss+xml').send(`<?xml version="1.0" encoding="UTF-8"?>
 <rss version="2.0">
   <channel>
-    <title>${SITE_NAME}</title>
+    <title>${escapeHtml(SITE_NAME)}</title>
     <link>${SITE_URL}</link>
-    <description>Thoughts, tutorials, and insights</description>
+    <description>${escapeHtml(SITE_DESCRIPTION)}</description>
     <language>en-us</language>
     ${items}
   </channel>
@@ -547,99 +1864,292 @@ app.get('/rss', async (req, res) => {
   }
 });
 
-// =====================
-// ADMIN ROUTES
-// =====================
-
 app.get('/admin/login', (req, res) => {
+  res.setHeader('Cache-Control', 'no-store');
+  const throttle = loginThrottleState(req);
+  const lockedMessage = throttle.blocked
+    ? `<div class="alert alert-error">Too many login attempts. Try again in ${Math.ceil(throttle.remainingMs / 60000)} minute(s).</div>`
+    : '';
   const error = req.query.error ? '<div class="alert alert-error">Invalid password.</div>' : '';
-  res.send(layout('Login', `
-    <div class="login-box">
-      <h1>Admin Login</h1>
-      ${error}
-      <form method="POST" action="/admin/login">
-        <div class="form-group">
-          <label>Password</label>
-          <input type="password" name="password" required autofocus>
-        </div>
-        <button type="submit" class="btn" style="width:100%;">Log In</button>
-      </form>
-    </div>`, { isAdmin: true }));
+  res.send(
+    layout(
+      'Login',
+      `
+      <div class="login-box">
+        <h1>Admin Login</h1>
+        ${lockedMessage}
+        ${error}
+        <form method="POST" action="/admin/login">
+          <div class="form-group">
+            <label>Password</label>
+            <input type="password" name="password" required autofocus ${throttle.blocked ? 'disabled' : ''}>
+          </div>
+          <button type="submit" class="btn" style="width:100%;" ${throttle.blocked ? 'disabled' : ''}>Log In</button>
+        </form>
+      </div>`,
+      { isAdmin: true }
+    )
+  );
 });
 
-app.post('/admin/login', (req, res) => {
-  if (req.body.password === ADMIN_PASSWORD) {
-    res.setHeader('Set-Cookie', 'blog_admin=1; Path=/; HttpOnly; SameSite=Strict; Max-Age=86400');
+app.post('/admin/login', requireTrustedOrigin, (req, res) => {
+  const throttle = loginThrottleState(req);
+  if (throttle.blocked) {
+    return res.redirect('/admin/login');
+  }
+
+  if (safeEqualStrings(req.body.password, ADMIN_PASSWORD)) {
+    clearFailedLogins(req);
+    setAdminSessionCookie(res, createAdminSession());
     return res.redirect('/admin');
   }
+
+  registerFailedLogin(req);
   res.redirect('/admin/login?error=1');
 });
 
-app.get('/admin/logout', (req, res) => {
-  res.setHeader('Set-Cookie', 'blog_admin=; Path=/; HttpOnly; Max-Age=0');
+app.get('/admin/logout', (_req, res) => {
+  clearAdminSessionCookie(res);
   res.redirect('/admin/login');
 });
 
-// Admin: list posts
 app.get('/admin', adminAuth, async (req, res) => {
   try {
     const db = await getPool();
     const [posts] = await db.execute(
       `SELECT p.*, c.name as category_name FROM posts p LEFT JOIN categories c ON p.category_id = c.id ORDER BY p.created_at DESC`
     );
-    const success = req.query.success ? `<div class="alert alert-success">${req.query.success}</div>` : '';
-    const rows = posts.map(p => {
-      const date = new Date(p.created_at).toLocaleDateString();
-      return `<tr>
-        <td><a href="/admin/posts/${p.id}/edit">${p.title}</a></td>
-        <td>${p.category_name || '—'}</td>
-        <td>${p.published ? '<span style="color:#2d6a4f;">Published</span>' : '<span style="color:#888;">Draft</span>'}</td>
-        <td>${date}</td>
-        <td class="actions">
-          <a href="/admin/posts/${p.id}/edit" class="btn btn-sm">Edit</a>
-          <form method="POST" action="/admin/posts/${p.id}/delete" style="display:inline;" onsubmit="return confirm('Delete this post?')">
-            <button type="submit" class="btn btn-sm btn-danger">Delete</button>
-          </form>
-        </td>
-      </tr>`;
-    }).join('');
 
-    res.send(layout('Posts', `
-      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:24px;">
-        <h1 class="page-title">Posts</h1>
-        <a href="/admin/posts/new" class="btn">New Post</a>
-      </div>
-      ${success}
-      <table class="admin-table">
-        <thead><tr><th>Title</th><th>Category</th><th>Status</th><th>Created</th><th>Actions</th></tr></thead>
-        <tbody>${rows || '<tr><td colspan="5" style="text-align:center;padding:40px;color:#888;">No posts yet.</td></tr>'}</tbody>
-      </table>`, { isAdmin: true }));
+    const success = req.query.success ? `<div class="alert alert-success">${escapeHtml(req.query.success)}</div>` : '';
+    const error = req.query.error ? '<div class="alert alert-error">The last change could not be completed.</div>' : '';
+    const rows = posts
+      .map((post) => {
+        const date = formatDate(post.created_at);
+        return `<tr>
+          <td><a href="/admin/posts/${post.id}/edit">${escapeHtml(post.title)}</a></td>
+          <td>${escapeHtml(post.category_name || '—')}</td>
+          <td>${post.published ? '<span style="color:#027a48;font-weight:700;">Published</span>' : '<span style="color:#667085;font-weight:700;">Draft</span>'}</td>
+          <td>${escapeHtml(date)}</td>
+          <td class="actions">
+            <a href="/admin/posts/${post.id}/edit" class="btn btn-sm">Edit</a>
+            <form method="POST" action="/admin/posts/${post.id}/delete" style="display:inline;" onsubmit="return confirm('Delete this post?')">
+              <input type="hidden" name="csrf_token" value="${escapeHtml(req.adminSession.csrf)}">
+              <button type="submit" class="btn btn-sm btn-danger">Delete</button>
+            </form>
+          </td>
+        </tr>`;
+      })
+      .join('');
+
+    res.send(
+      layout(
+        'Posts',
+        `
+        <div style="display:flex;justify-content:space-between;align-items:flex-end;gap:16px;flex-wrap:wrap;margin-bottom:24px;">
+          <div>
+            <h1 class="page-title">Posts</h1>
+            <p class="page-subtitle">Write company updates, publish launches, and embed product video directly in a post.</p>
+          </div>
+          <a href="/admin/posts/new" class="btn">New Post</a>
+        </div>
+        ${success}
+        ${error}
+        <table class="admin-table">
+          <thead><tr><th>Title</th><th>Category</th><th>Status</th><th>Created</th><th>Actions</th></tr></thead>
+          <tbody>${rows || '<tr><td colspan="5" style="text-align:center;padding:36px;color:#667085;">No posts yet.</td></tr>'}</tbody>
+        </table>`,
+        { isAdmin: true }
+      )
+    );
   } catch (err) {
     console.error(err);
     res.status(500).send(layout('Error', '<p>Something went wrong.</p>', { isAdmin: true }));
   }
 });
 
-// Admin: new post form
-app.get('/admin/posts/new', adminAuth, async (req, res) => {
-  const db = await getPool();
-  const [categories] = await db.execute('SELECT * FROM categories ORDER BY name');
-  const catOptions = categories.map(c => `<option value="${c.id}">${c.name}</option>`).join('');
-  res.send(layout('New Post', postForm({ catOptions }), { isAdmin: true }));
+app.get('/admin/media', adminAuth, async (req, res) => {
+  try {
+    const db = await getPool();
+    const [assets] = await db.execute('SELECT * FROM media_assets ORDER BY created_at DESC');
+    const [totals] = await db.execute(
+      'SELECT COUNT(*) AS total, COALESCE(SUM(size_bytes), 0) AS total_size FROM media_assets'
+    );
+
+    const stats = totals[0] || { total: 0, total_size: 0 };
+    const success = req.query.success ? `<div class="alert alert-success">${escapeHtml(req.query.success)}</div>` : '';
+    const error = req.query.error ? `<div class="alert alert-error">${escapeHtml(req.query.error)}</div>` : '';
+    const rows = assets
+      .map((asset) => {
+        const publicPath = buildMediaPublicPath(asset);
+        const shortcode = buildMediaShortcode(asset);
+        return `<tr>
+          <td>
+            <div style="font-weight:800;">${escapeHtml(asset.original_name)}</div>
+            <div class="form-help">${escapeHtml(asset.mime_type)} • ${escapeHtml(formatBytes(asset.size_bytes))}</div>
+          </td>
+          <td><span class="media-chip media-chip--${escapeHtml(asset.kind)}">${escapeHtml(asset.kind)}</span></td>
+          <td>
+            <code class="media-code">${escapeHtml(publicPath)}</code>
+            ${asset.kind === 'image' || asset.kind === 'video' ? `<code class="media-code">${escapeHtml(shortcode)}</code>` : ''}
+          </td>
+          <td>${escapeHtml(formatDate(asset.created_at))}</td>
+          <td class="actions">
+            <a href="${escapeHtml(publicPath)}" class="btn btn-sm btn-secondary" target="_blank" rel="noreferrer">Open</a>
+            <form method="POST" action="/admin/media/${asset.id}/delete" style="display:inline;" onsubmit="return confirm('Delete this media asset? Existing embeds will stop working.')">
+              <input type="hidden" name="csrf_token" value="${escapeHtml(req.adminSession.csrf)}">
+              <button type="submit" class="btn btn-sm btn-danger">Delete</button>
+            </form>
+          </td>
+        </tr>`;
+      })
+      .join('');
+
+    res.send(
+      layout(
+        'Media',
+        `
+        <div style="display:flex;justify-content:space-between;align-items:flex-end;gap:16px;flex-wrap:wrap;margin-bottom:24px;">
+          <div>
+            <h1 class="page-title">Media</h1>
+            <p class="page-subtitle">Upload images and video to Dailey OS storage, then paste the generated paths into your posts.</p>
+            <div class="stat-pills">
+              <span class="stat-pill">${escapeHtml(String(stats.total))} asset${Number(stats.total) === 1 ? '' : 's'}</span>
+              <span class="stat-pill">${escapeHtml(formatBytes(stats.total_size))} stored</span>
+              <span class="stat-pill">${hasStorageConfig() ? 'Storage connected' : 'Storage unavailable'}</span>
+            </div>
+          </div>
+        </div>
+        ${success}
+        ${error}
+        <div class="admin-grid">
+          <section class="admin-card">
+            <h2>Upload Asset</h2>
+            <p>Files are stored in S3-compatible object storage so embeds survive restarts, redeploys, and replica changes.</p>
+            ${
+              hasStorageConfig()
+                ? `
+            <form method="POST" action="/admin/media" enctype="multipart/form-data" style="margin-top:18px;">
+              <input type="hidden" name="csrf_token" value="${escapeHtml(req.adminSession.csrf)}">
+              <div class="form-group" style="margin-bottom:12px;">
+                <label>Media File</label>
+                <input type="file" name="file" accept="image/avif,image/gif,image/jpeg,image/png,image/webp,video/mp4,video/ogg,video/quicktime,video/webm,video/x-m4v" required>
+              </div>
+              <div class="form-help">Supported: JPG, PNG, WebP, GIF, AVIF, MP4, WebM, OGG, MOV, M4V. Max ${Math.round(
+                MEDIA_UPLOAD_MAX_BYTES / (1024 * 1024)
+              )} MB.</div>
+              <button type="submit" class="btn" style="margin-top:16px;">Upload Media</button>
+            </form>`
+                : `
+            <div class="alert alert-error" style="margin-top:18px;">
+              Storage env vars are missing. Enable storage for this project in Dailey OS before uploading media.
+            </div>`
+            }
+          </section>
+          <aside class="notes-card" style="margin:0;">
+            <strong>Usage</strong>
+            <p>Video shortcode: <code>{{video:/media/123/launch-demo.mp4|Optional caption}}</code></p>
+            <p>Image shortcode: <code>{{image:/media/456/team-photo.webp|Optional caption}}</code></p>
+            <p>YouTube still works with <code>{{youtube:https://www.youtube.com/watch?v=VIDEO_ID|Optional caption}}</code>.</p>
+            <p>${STORAGE_BUCKET ? `Bucket <code>${escapeHtml(STORAGE_BUCKET)}</code>` : 'Bucket will come from Dailey OS at runtime.'}${
+              STORAGE_PREFIX ? ` Prefix <code>${escapeHtml(STORAGE_PREFIX)}</code>.` : ''
+            }</p>
+          </aside>
+        </div>
+        <table class="admin-table">
+          <thead><tr><th>Asset</th><th>Type</th><th>Embed Path</th><th>Uploaded</th><th>Actions</th></tr></thead>
+          <tbody>${rows || '<tr><td colspan="5" style="text-align:center;padding:36px;color:#667085;">No media uploaded yet.</td></tr>'}</tbody>
+        </table>`,
+        { isAdmin: true }
+      )
+    );
+  } catch (err) {
+    console.error(err);
+    res.status(500).send(layout('Error', '<p>Something went wrong.</p>', { isAdmin: true }));
+  }
 });
 
-// Admin: create post
-app.post('/admin/posts', adminAuth, async (req, res) => {
+app.post('/admin/media', adminAuth, requireTrustedOrigin, requireStorageForAdmin, handleMediaUpload, requireAdminCsrf, async (req, res) => {
+  try {
+    if (!hasStorageConfig()) {
+      return res.redirect('/admin/media?error=Storage%20is%20not%20configured%20for%20uploads.');
+    }
+
+    if (!req.file) {
+      return res.redirect('/admin/media?error=Choose%20a%20file%20before%20uploading.');
+    }
+
+    const db = await getPool();
+    const kind = mediaKindFromMime(req.file.mimetype);
+    const storageKey = buildStorageObjectKey(req.file);
+
+    await getStorageClient().send(
+      new PutObjectCommand({
+        Bucket: STORAGE_BUCKET,
+        Key: storageKey,
+        Body: req.file.buffer,
+        ContentType: req.file.mimetype,
+        CacheControl: kind === 'image' || kind === 'video' ? 'public, max-age=31536000, immutable' : 'public, max-age=3600',
+      })
+    );
+
+    await db.execute(
+      'INSERT INTO media_assets (original_name, storage_key, mime_type, size_bytes, kind) VALUES (?, ?, ?, ?, ?)',
+      [path.basename(req.file.originalname), storageKey, req.file.mimetype, req.file.size, kind]
+    );
+
+    res.redirect('/admin/media?success=Media%20uploaded');
+  } catch (err) {
+    console.error(err);
+    res.redirect('/admin/media?error=Upload%20failed');
+  }
+});
+
+app.post('/admin/media/:id/delete', adminAuth, requireTrustedOrigin, requireStorageForAdmin, requireAdminCsrf, async (req, res) => {
+  try {
+    if (!hasStorageConfig()) {
+      return res.redirect('/admin/media?error=Storage%20is%20not%20configured%20for%20deletes.');
+    }
+
+    const db = await getPool();
+    const [assets] = await db.execute('SELECT * FROM media_assets WHERE id = ?', [req.params.id]);
+    if (assets.length === 0) {
+      return res.redirect('/admin/media?error=Media%20asset%20not%20found');
+    }
+
+    const asset = assets[0];
+    await getStorageClient().send(new DeleteObjectCommand({ Bucket: STORAGE_BUCKET, Key: asset.storage_key }));
+    await db.execute('DELETE FROM media_assets WHERE id = ?', [req.params.id]);
+    res.redirect('/admin/media?success=Media%20deleted');
+  } catch (err) {
+    console.error(err);
+    res.redirect('/admin/media?error=Delete%20failed');
+  }
+});
+
+app.get('/admin/posts/new', adminAuth, async (_req, res) => {
+  const db = await getPool();
+  const [categories] = await db.execute('SELECT * FROM categories ORDER BY name');
+  const catOptions = categories
+    .map((category) => `<option value="${category.id}">${escapeHtml(category.name)}</option>`)
+    .join('');
+
+  res.send(layout('New Post', postForm({ catOptions, csrfToken: _req.adminSession.csrf }), { isAdmin: true }));
+});
+
+app.post('/admin/posts', adminAuth, requireTrustedOrigin, requireAdminCsrf, async (req, res) => {
   try {
     const db = await getPool();
     const { title, content, excerpt, category_id, tags, published } = req.body;
     const slug = slugify(title);
-    const tagsArr = tags ? tags.split(',').map(t => t.trim()).filter(Boolean) : [];
+    const tagsArr = tags ? tags.split(',').map((tag) => tag.trim()).filter(Boolean) : [];
     const isPublished = published === 'on' ? 1 : 0;
+
     await db.execute(
-      `INSERT INTO posts (title, slug, content, excerpt, category_id, tags, published, published_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO posts (title, slug, content, excerpt, category_id, tags, published, published_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
       [title, slug, content, excerpt || null, category_id || null, JSON.stringify(tagsArr), isPublished, isPublished ? new Date() : null]
     );
+
     res.redirect('/admin?success=Post+created');
   } catch (err) {
     console.error(err);
@@ -647,88 +2157,120 @@ app.post('/admin/posts', adminAuth, async (req, res) => {
   }
 });
 
-// Admin: edit post form
 app.get('/admin/posts/:id/edit', adminAuth, async (req, res) => {
   try {
     const db = await getPool();
     const [posts] = await db.execute('SELECT * FROM posts WHERE id = ?', [req.params.id]);
     if (posts.length === 0) return res.redirect('/admin');
-    const p = posts[0];
+
+    const post = posts[0];
     const [categories] = await db.execute('SELECT * FROM categories ORDER BY name');
-    const catOptions = categories.map(c => `<option value="${c.id}" ${c.id === p.category_id ? 'selected' : ''}>${c.name}</option>`).join('');
-    const tags = (typeof p.tags === 'string' ? JSON.parse(p.tags) : p.tags) || [];
-    res.send(layout('Edit Post', postForm({
-      catOptions, action: `/admin/posts/${p.id}`, post: p, tags: tags.join(', '), isEdit: true
-    }), { isAdmin: true }));
+    const catOptions = categories
+      .map(
+        (category) =>
+          `<option value="${category.id}" ${category.id === post.category_id ? 'selected' : ''}>${escapeHtml(category.name)}</option>`
+      )
+      .join('');
+
+    res.send(
+      layout(
+        'Edit Post',
+        postForm({
+          catOptions,
+          action: `/admin/posts/${post.id}`,
+          csrfToken: req.adminSession.csrf,
+          post,
+          tags: parseTags(post.tags).join(', '),
+          isEdit: true,
+        }),
+        { isAdmin: true }
+      )
+    );
   } catch (err) {
     console.error(err);
     res.redirect('/admin');
   }
 });
 
-// Admin: update post
-app.post('/admin/posts/:id', adminAuth, async (req, res) => {
+app.post('/admin/posts/:id', adminAuth, requireTrustedOrigin, requireAdminCsrf, async (req, res) => {
   try {
     const db = await getPool();
     const { title, content, excerpt, category_id, tags, published } = req.body;
     const slug = slugify(title);
-    const tagsArr = tags ? tags.split(',').map(t => t.trim()).filter(Boolean) : [];
+    const tagsArr = tags ? tags.split(',').map((tag) => tag.trim()).filter(Boolean) : [];
     const isPublished = published === 'on' ? 1 : 0;
+
     await db.execute(
-      `UPDATE posts SET title=?, slug=?, content=?, excerpt=?, category_id=?, tags=?, published=?, published_at=COALESCE(published_at, IF(?, NOW(), NULL)), updated_at=NOW() WHERE id=?`,
+      `UPDATE posts
+       SET title = ?, slug = ?, content = ?, excerpt = ?, category_id = ?, tags = ?, published = ?,
+           published_at = COALESCE(published_at, IF(?, NOW(), NULL)),
+           updated_at = NOW()
+       WHERE id = ?`,
       [title, slug, content, excerpt || null, category_id || null, JSON.stringify(tagsArr), isPublished, isPublished, req.params.id]
     );
+
     res.redirect('/admin?success=Post+updated');
   } catch (err) {
     console.error(err);
-    res.redirect('/admin');
+    res.redirect('/admin?error=1');
   }
 });
 
-// Admin: delete post
-app.post('/admin/posts/:id/delete', adminAuth, async (req, res) => {
+app.post('/admin/posts/:id/delete', adminAuth, requireTrustedOrigin, requireAdminCsrf, async (req, res) => {
   try {
     const db = await getPool();
     await db.execute('DELETE FROM posts WHERE id = ?', [req.params.id]);
     res.redirect('/admin?success=Post+deleted');
   } catch (err) {
     console.error(err);
-    res.redirect('/admin');
+    res.redirect('/admin?error=1');
   }
 });
 
-// Admin: categories
-app.get('/admin/categories', adminAuth, async (req, res) => {
+app.get('/admin/categories', adminAuth, async (_req, res) => {
   try {
     const db = await getPool();
     const [categories] = await db.execute('SELECT * FROM categories ORDER BY name');
-    const rows = categories.map(c => `<tr>
-      <td>${c.name}</td>
-      <td style="color:#888;">${c.slug}</td>
-      <td>
-        <form method="POST" action="/admin/categories/${c.id}/delete" style="display:inline;" onsubmit="return confirm('Delete this category?')">
-          <button type="submit" class="btn btn-sm btn-danger">Delete</button>
-        </form>
-      </td>
-    </tr>`).join('');
+    const rows = categories
+      .map(
+        (category) => `<tr>
+          <td>${escapeHtml(category.name)}</td>
+          <td style="color:#667085;">${escapeHtml(category.slug)}</td>
+          <td>
+            <form method="POST" action="/admin/categories/${category.id}/delete" style="display:inline;" onsubmit="return confirm('Delete this category?')">
+              <input type="hidden" name="csrf_token" value="${escapeHtml(_req.adminSession.csrf)}">
+              <button type="submit" class="btn btn-sm btn-danger">Delete</button>
+            </form>
+          </td>
+        </tr>`
+      )
+      .join('');
 
-    res.send(layout('Categories', `
-      <h1 class="page-title">Categories</h1>
-      <form method="POST" action="/admin/categories" style="display:flex;gap:12px;margin:24px 0;">
-        <input type="text" name="name" placeholder="New category name" required style="flex:1;padding:10px 14px;border:1px solid #ddd;border-radius:8px;font-size:15px;">
-        <button type="submit" class="btn">Add</button>
-      </form>
-      <table class="admin-table">
-        <thead><tr><th>Name</th><th>Slug</th><th>Actions</th></tr></thead>
-        <tbody>${rows}</tbody>
-      </table>`, { isAdmin: true }));
+    res.send(
+      layout(
+        'Categories',
+        `
+        <h1 class="page-title">Categories</h1>
+        <p class="page-subtitle">Keep the blog taxonomy tight. A few strong buckets reads better than a crowded category list.</p>
+        <form method="POST" action="/admin/categories" style="display:flex;gap:12px;flex-wrap:wrap;margin:24px 0;">
+          <input type="hidden" name="csrf_token" value="${escapeHtml(_req.adminSession.csrf)}">
+          <input type="text" name="name" placeholder="New category name" required style="flex:1;min-width:220px;padding:12px 14px;border:1px solid #d8dee9;border-radius:12px;font-size:15px;">
+          <button type="submit" class="btn">Add</button>
+        </form>
+        <table class="admin-table">
+          <thead><tr><th>Name</th><th>Slug</th><th>Actions</th></tr></thead>
+          <tbody>${rows || '<tr><td colspan="3" style="text-align:center;padding:36px;color:#667085;">No categories yet.</td></tr>'}</tbody>
+        </table>`,
+        { isAdmin: true }
+      )
+    );
   } catch (err) {
     console.error(err);
     res.status(500).send(layout('Error', '<p>Something went wrong.</p>', { isAdmin: true }));
   }
 });
 
-app.post('/admin/categories', adminAuth, async (req, res) => {
+app.post('/admin/categories', adminAuth, requireTrustedOrigin, requireAdminCsrf, async (req, res) => {
   try {
     const db = await getPool();
     const { name } = req.body;
@@ -740,28 +2282,43 @@ app.post('/admin/categories', adminAuth, async (req, res) => {
   }
 });
 
-app.post('/admin/categories/:id/delete', adminAuth, async (req, res) => {
+app.post('/admin/categories/:id/delete', adminAuth, requireTrustedOrigin, requireAdminCsrf, async (req, res) => {
   try {
     const db = await getPool();
     await db.execute('DELETE FROM categories WHERE id = ?', [req.params.id]);
     res.redirect('/admin/categories');
   } catch (err) {
+    console.error(err);
     res.redirect('/admin/categories');
   }
 });
 
-function postForm({ catOptions, action, post, tags, isEdit }) {
-  const p = post || {};
+function postForm({ catOptions, action, csrfToken, post, tags, isEdit }) {
+  const currentPost = post || {};
+  const encodedContent = escapeHtml(currentPost.content || '');
+
   return `
-    <h1 class="page-title">${isEdit ? 'Edit Post' : 'New Post'}</h1>
+    <div style="display:flex;justify-content:space-between;align-items:flex-end;gap:16px;flex-wrap:wrap;">
+      <div>
+        <h1 class="page-title">${isEdit ? 'Edit Post' : 'New Post'}</h1>
+        <p class="page-subtitle">Keep the writing clean and the layout simple. The post body supports Markdown plus video shortcodes.</p>
+      </div>
+    </div>
+    <div class="notes-card">
+      <strong>Video Embeds</strong>
+      <p>Use <code>{{youtube:https://www.youtube.com/watch?v=VIDEO_ID|Optional caption}}</code> for a YouTube embed.</p>
+      <p>Use <code>{{video:/media/123/launch-demo.mp4|Optional caption}}</code> for hosted video and <code>{{image:/media/456/team-photo.webp|Optional caption}}</code> for hosted images.</p>
+      <p>Upload assets in <a href="/admin/media">Media</a>. Every upload gets a stable <code>/media/...</code> path backed by Dailey OS object storage.</p>
+    </div>
     <form method="POST" action="${action || '/admin/posts'}" style="margin-top:24px;">
+      <input type="hidden" name="csrf_token" value="${escapeHtml(csrfToken || '')}">
       <div class="form-group">
         <label>Title</label>
-        <input type="text" name="title" value="${p.title || ''}" required>
+        <input type="text" name="title" value="${escapeHtml(currentPost.title || '')}" required>
       </div>
       <div class="form-group">
         <label>Excerpt</label>
-        <input type="text" name="excerpt" value="${p.excerpt || ''}" placeholder="Brief summary for listing pages">
+        <input type="text" name="excerpt" value="${escapeHtml(currentPost.excerpt || '')}" placeholder="Short summary for the home page and SEO cards">
       </div>
       <div class="form-group">
         <label>Category</label>
@@ -769,33 +2326,72 @@ function postForm({ catOptions, action, post, tags, isEdit }) {
       </div>
       <div class="form-group">
         <label>Tags (comma-separated)</label>
-        <input type="text" name="tags" value="${tags || ''}" placeholder="e.g. javascript, tutorial, webdev">
+        <input type="text" name="tags" value="${escapeHtml(tags || '')}" placeholder="e.g. launch, engineering, company">
       </div>
       <div class="form-group">
         <label>Content (Markdown)</label>
-        <textarea name="content" required>${p.content || ''}</textarea>
+        <textarea name="content" required>${encodedContent}</textarea>
+        <div class="form-help">Markdown is supported for headings, lists, links, inline code, block quotes, and the media shortcodes above.</div>
       </div>
       <div class="form-group checkbox-group">
-        <input type="checkbox" name="published" id="published" ${p.published ? 'checked' : ''}>
+        <input type="checkbox" name="published" id="published" ${currentPost.published ? 'checked' : ''}>
         <label for="published" style="margin:0;">Published</label>
       </div>
-      <div style="display:flex;gap:12px;margin-top:24px;">
+      <div style="display:flex;gap:12px;flex-wrap:wrap;margin-top:24px;">
         <button type="submit" class="btn">${isEdit ? 'Update Post' : 'Create Post'}</button>
-        <a href="/admin" class="btn" style="background:#888;">Cancel</a>
+        <a href="/admin" class="btn btn-secondary">Cancel</a>
       </div>
     </form>`;
 }
 
-// Health check
-app.get('/health', (req, res) => res.json({ status: 'ok' }));
+app.get('/health', (_req, res) => res.json({ status: 'ok' }));
 
-// Start server
+function validateSecurityConfig() {
+  const issues = [];
+  const warnings = [];
+
+  if (ADMIN_PASSWORD === 'admin') {
+    issues.push('ADMIN_PASSWORD is still set to the default value.');
+  }
+
+  if (!ADMIN_SESSION_SECRET) {
+    issues.push('ADMIN_SESSION_SECRET is not set.');
+  }
+
+  if (!hasStorageConfig()) {
+    const storageMessage =
+      'S3-compatible storage is not configured. Enable storage in Dailey OS or set S3_ENDPOINT, S3_BUCKET_NAME, S3_ACCESS_KEY_ID, and S3_SECRET_ACCESS_KEY.';
+
+    if (IS_PRODUCTION) {
+      issues.push(storageMessage);
+    } else {
+      warnings.push(storageMessage);
+    }
+  }
+
+  warnings.forEach((warning) => {
+    console.warn(`[storage] ${warning} Uploads and hosted media are disabled until configured.`);
+  });
+
+  if (issues.length === 0) return;
+
+  const message = issues.join(' ');
+  if (IS_PRODUCTION) {
+    throw new Error(message);
+  }
+
+  console.warn(`[security] ${message} Development fallback mode is enabled; set both before deploying.`);
+}
+
 async function start() {
+  validateSecurityConfig();
+
   try {
     await migrate();
   } catch (err) {
     console.error('[startup] Migration failed, continuing...', err.message);
   }
+
   app.listen(PORT, () => {
     console.log(`Blog running on port ${PORT}`);
   });
