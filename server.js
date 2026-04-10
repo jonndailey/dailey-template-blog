@@ -1630,6 +1630,14 @@ function adminAuth(req, res, next) {
 
 function requireTrustedOrigin(req, res, next) {
   if (isTrustedOrigin(req)) return next();
+  console.warn('[origin-block]', JSON.stringify({
+    origin: req.headers.origin,
+    referer: req.headers.referer,
+    host: req.headers.host,
+    xfp: req.headers['x-forwarded-proto'],
+    xfh: req.headers['x-forwarded-host'],
+    computed: currentRequestOrigin(req),
+  }));
   res.status(403).send(layout('Forbidden', '<p>Request origin not allowed.</p>', { isAdmin: true }));
 }
 
