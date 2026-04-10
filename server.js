@@ -595,14 +595,22 @@ function clearFailedLogins(req) {
 }
 
 function currentRequestOrigin(req) {
+  // Prefer SITE_URL when configured — it is the canonical public origin and
+  // bypasses TLS-termination-induced protocol drift (Cloudflare → HTTP →
+  // ingress-nginx sees X-Forwarded-Proto: http even though the browser used
+  // HTTPS, which would otherwise fail the trusted-origin check).
+  if (SITE_URL && !SITE_URL.startsWith('http://localhost')) {
+    try {
+      return new URL(SITE_URL).origin;
+    } catch {
+      // fall through to header-based detection
+    }
+  }
   const forwardedProto = String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim();
   const forwardedHost = String(req.headers['x-forwarded-host'] || '').split(',')[0].trim();
   const protocol = forwardedProto || req.protocol || (IS_PRODUCTION ? 'https' : 'http');
   const host = forwardedHost || req.headers.host;
   if (!host) return null;
-  // Normalize via URL constructor so default ports (:443 for https, :80 for http)
-  // are stripped — ingress-nginx forwards Host with :443 which would otherwise
-  // mismatch the browser-supplied Origin header (which omits the default port).
   try {
     return new URL(`${protocol}://${host}`).origin;
   } catch {
@@ -615,9 +623,17 @@ function isTrustedOrigin(req) {
   if (!candidate) return true;
 
   try {
+    const candidateUrl = new URL(candidate);
     const requestOrigin = currentRequestOrigin(req);
     if (!requestOrigin) return false;
-    return new URL(candidate).origin === requestOrigin;
+    if (candidateUrl.origin === requestOrigin) return true;
+    // Cloudflare/Tunnel terminates TLS upstream and forwards plain HTTP to
+    // ingress-nginx, so X-Forwarded-Proto can legitimately say "http" even
+    // though the browser used HTTPS. As long as the hostnames match the
+    // ingress-derived host, treat the origin as trusted — CSRF protection
+    // still requires same-host, which is the property that matters.
+    const requestUrl = new URL(requestOrigin);
+    return candidateUrl.hostname === requestUrl.hostname;
   } catch {
     return false;
   }
@@ -1630,14 +1646,6 @@ function adminAuth(req, res, next) {
 
 function requireTrustedOrigin(req, res, next) {
   if (isTrustedOrigin(req)) return next();
-  console.warn('[origin-block]', JSON.stringify({
-    origin: req.headers.origin,
-    referer: req.headers.referer,
-    host: req.headers.host,
-    xfp: req.headers['x-forwarded-proto'],
-    xfh: req.headers['x-forwarded-host'],
-    computed: currentRequestOrigin(req),
-  }));
   res.status(403).send(layout('Forbidden', '<p>Request origin not allowed.</p>', { isAdmin: true }));
 }
 
