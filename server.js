@@ -599,7 +599,15 @@ function currentRequestOrigin(req) {
   const forwardedHost = String(req.headers['x-forwarded-host'] || '').split(',')[0].trim();
   const protocol = forwardedProto || req.protocol || (IS_PRODUCTION ? 'https' : 'http');
   const host = forwardedHost || req.headers.host;
-  return host ? `${protocol}://${host}` : null;
+  if (!host) return null;
+  // Normalize via URL constructor so default ports (:443 for https, :80 for http)
+  // are stripped — ingress-nginx forwards Host with :443 which would otherwise
+  // mismatch the browser-supplied Origin header (which omits the default port).
+  try {
+    return new URL(`${protocol}://${host}`).origin;
+  } catch {
+    return null;
+  }
 }
 
 function isTrustedOrigin(req) {
