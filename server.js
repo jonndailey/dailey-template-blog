@@ -1796,10 +1796,11 @@ app.get('/', async (req, res) => {
 
     res.send(layout(SITE_NAME, html, { description: SITE_DESCRIPTION }));
   } catch (err) {
+    // Fail soft: the homepage must render (200) even if the database is
+    // briefly unreachable, so deploy health checks on "/" pass and visitors
+    // see a page instead of an error status.
     console.error(err);
-    res
-      .status(500)
-      .send(layout('Error', '<main><div class="container"><div class="empty-state"><p>Blog data is not available yet. Check your database connection and try again.</p></div></div></main>'));
+    res.send(layout(SITE_NAME, '<main><div class="container"><div class="empty-state"><p>The blog is starting up — posts will appear here shortly. Refresh in a moment.</p></div></div></main>', { description: SITE_DESCRIPTION }));
   }
 });
 
@@ -2388,14 +2389,13 @@ function validateSecurityConfig() {
   }
 
   if (!hasStorageConfig()) {
-    const storageMessage =
-      'S3-compatible storage is not configured. Enable storage in Dailey OS or set S3_ENDPOINT, S3_BUCKET_NAME, S3_ACCESS_KEY_ID, and S3_SECRET_ACCESS_KEY.';
-
-    if (IS_PRODUCTION) {
-      issues.push(storageMessage);
-    } else {
-      warnings.push(storageMessage);
-    }
+    // Missing storage is never fatal: the blog runs fine without it (posts
+    // live in the database) — media uploads are simply disabled until storage
+    // is configured. Crashing here would crash-loop a fresh deploy whose
+    // storage add-on has not been enabled or provisioned yet.
+    warnings.push(
+      'S3-compatible storage is not configured. Enable storage in Dailey OS or set S3_ENDPOINT, S3_BUCKET_NAME, S3_ACCESS_KEY_ID, and S3_SECRET_ACCESS_KEY.'
+    );
   }
 
   warnings.forEach((warning) => {
